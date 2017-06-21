@@ -39,7 +39,6 @@ module Node.Internal (
     closeChannel,
     startNode,
     stopNode,
-    withOutChannel,
     withInOutChannel,
     writeMany,
     Timeout(..)
@@ -1368,13 +1367,6 @@ controlHeaderCodeBidirectionalSyn = fromIntegral (fromEnum 'S')
 controlHeaderCodeBidirectionalAck :: Word8
 controlHeaderCodeBidirectionalAck = fromIntegral (fromEnum 'A')
 
-controlHeaderCodeUnidirectional :: Word8
-controlHeaderCodeUnidirectional = fromIntegral (fromEnum 'U')
-
-controlHeaderUnidirectional :: BS.ByteString
-controlHeaderUnidirectional =
-    BS.singleton controlHeaderCodeUnidirectional
-
 controlHeaderBidirectionalSyn :: Nonce -> BS.ByteString
 controlHeaderBidirectionalSyn (Nonce nonce) =
     fixedSizeBuilder' 9 $
@@ -1455,28 +1447,6 @@ withInOutChannel node@Node{nodeEnvironment, nodeState} nodeid@(NodeId peer) acti
     bracket (connectToPeer node nodeid)
             (\conn -> disconnectFromPeer node nodeid conn)
             action'
-
--- | Create, use, and tear down a unidirectional channel to a peer identified
---   by 'NodeId'.
-withOutChannel
-    :: ( Mockable Bracket m, Mockable Async m, Ord (ThreadId m)
-       , Mockable Throw m, Mockable Catch m
-       , Mockable SharedAtomic m, Mockable CurrentTime m
-       , Mockable SharedExclusive m
-       , Mockable Metrics.Metrics m
-       , MonadFix m, WithLogger m
-       , Serializable packingType peerData )
-    => Node packingType peerData m
-    -> NodeId
-    -> (ChannelOut m -> m a)
-    -> m a
-withOutChannel node@Node{nodeState} nodeid@(NodeId peer) action = do
-    let provenance = Local peer Nothing
-    (promise, _) <- spawnHandler nodeState provenance $
-        bracket (connectOutChannel node nodeid)
-                (\(ChannelOut conn) -> disconnectFromPeer node nodeid conn)
-                action
-    wait promise
 
 data OutboundConnectionState m =
       -- | A stable outbound connection has some positive number of established
@@ -1808,23 +1778,3 @@ connectToPeer Node{nodeEndPoint, nodeState, nodePackingType, nodePeerData, nodeE
                 readSharedExclusive excl
                 startConnecting
             Right () -> return ()
-
--- | Connect to a peer given by a 'NodeId' unidirectionally.
-connectOutChannel
-    :: ( Mockable Throw m
-       , Mockable Bracket m
-       , Mockable SharedAtomic m
-       , Mockable SharedExclusive m
-       , Serializable packingType peerData
-       , WithLogger m
-       )
-    => Node packingType peerData m
-    -> NodeId
-    -> m (ChannelOut m)
-connectOutChannel node peer = do
-    conn <- connectToPeer node peer
-    outcome <- NT.send conn [controlHeaderUnidirectional]
-    case outcome of
-        Left err -> throw err
-        Right () -> return ()
-    return (ChannelOut conn)
