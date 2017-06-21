@@ -92,8 +92,6 @@ instance Binary NodeId
 data NodeState peerData m = NodeState {
       _nodeStateGen                    :: !StdGen
       -- ^ To generate nonces.
-    , _nodeStateOutboundUnidirectional :: !(Map NT.EndPointAddress (SomeHandler m))
-      -- ^ Handlers for each locally-initiated unidirectional connection.
     , _nodeStateOutboundBidirectional  :: !(Map NT.EndPointAddress (Map Nonce (SomeHandler m, Maybe BS.ByteString -> m (), Int -> m (), SharedExclusiveT m peerData, NT.ConnectionBundle, Promise m (), Bool)))
       -- ^ Handlers for each nonce which we generated (locally-initiated
       --   bidirectional connections).
@@ -131,7 +129,6 @@ initialNodeState prng = do
     !stats <- initialStatistics
     let nodeState = NodeState {
               _nodeStateGen = prng
-            , _nodeStateOutboundUnidirectional = Map.empty
             , _nodeStateOutboundBidirectional = Map.empty
             , _nodeStateInbound = Set.empty
             , _nodeStateConnectedTo = Map.empty
@@ -436,9 +433,8 @@ initialStatistics = do
         }
 
 data HandlerProvenance peerData m t =
-      -- | Initiated locally, _to_ this peer. The Nonce is present if and only
-      --   if it's a bidirectional connection.
-      Local !NT.EndPointAddress (Maybe (Nonce, SharedExclusiveT m peerData, NT.ConnectionBundle, Promise m (), t))
+      -- | Initiated locally, _to_ this peer.
+      Local !NT.EndPointAddress (Nonce, SharedExclusiveT m peerData, NT.ConnectionBundle, Promise m (), t)
       -- | Initiated remotely, _by_ or _from_ this peer.
     | Remote !NT.EndPointAddress !NT.ConnectionId
 
@@ -447,7 +443,7 @@ instance Show (HandlerProvenance peerData m t) where
         Local addr mdata -> concat [
               "Local "
             , show addr
-            , show (fmap (\(x,_,_,_,_) -> x) mdata)
+            , show ((\(x,_,_,_,_) -> x) $ mdata)
             ]
         Remote addr connid -> concat ["Remote ", show addr, show connid]
 
@@ -767,8 +763,7 @@ waitForRunningHandlers
 waitForRunningHandlers node = do
     -- Gather the promises for all handlers.
     handlers <- withSharedAtomic (nodeState node) $ \st -> do
-        let outbound_uni = Map.elems (_nodeStateOutboundUnidirectional st)
-            -- List monad computation: grab the values of the map (ignoring
+        let -- List monad computation: grab the values of the map (ignoring
             -- peer keys), then for each of those maps grab its values (ignoring
             -- nonce keys) and then return the promise.
             outbound_bi = do
@@ -776,8 +771,7 @@ waitForRunningHandlers node = do
                 (x, _, _, _, _, _, _) <- Map.elems map
                 return x
             inbound = Set.toList (_nodeStateInbound st)
-            all = outbound_uni ++ outbound_bi ++ inbound
-        logDebug $ sformat ("waiting for " % shown % " outbound unidirectional handlers") (fmap (someHandlerThreadId) outbound_uni)
+            all = outbound_bi ++ inbound
         logDebug $ sformat ("waiting for " % shown % " outbound bidirectional handlers") (fmap (someHandlerThreadId) outbound_bi)
         logDebug $ sformat ("waiting for " % shown % " outbound inbound") (fmap (someHandlerThreadId) inbound)
         return all
@@ -1299,15 +1293,12 @@ spawnHandler stateVar provenance action =
                 Remote _ _ -> nodeState {
                       _nodeStateInbound = Set.insert someHandler (_nodeStateInbound nodeState)
                     }
-                Local peer (Just (nonce, peerDataVar, connBundle, timeoutPromise, dumpBytes)) -> nodeState {
+                Local peer (nonce, peerDataVar, connBundle, timeoutPromise, dumpBytes) -> nodeState {
                       _nodeStateOutboundBidirectional = Map.alter alteration peer (_nodeStateOutboundBidirectional nodeState)
                     }
                     where
                     alteration Nothing = Just $ Map.singleton nonce (someHandler, dumpBytes, incrBytes, peerDataVar, connBundle, timeoutPromise, False)
                     alteration (Just map) = Just $ Map.insert nonce (someHandler, dumpBytes, incrBytes, peerDataVar, connBundle, timeoutPromise, False) map
-                Local peer Nothing -> nodeState {
-                      _nodeStateOutboundUnidirectional = Map.insert peer someHandler (_nodeStateOutboundUnidirectional nodeState)
-                    }
 
             incrBytes !n = do
                 nodeState <- readSharedAtomic stateVar
@@ -1342,16 +1333,13 @@ spawnHandler stateVar provenance action =
                         }
                     -- Remove the nonce for this peer, and remove the whole map
                     -- if this was the only nonce for that peer.
-                    Local peer (Just (nonce, _, _, _, _)) -> nodeState {
+                    Local peer (nonce, _, _, _, _) -> nodeState {
                           _nodeStateOutboundBidirectional = Map.update updater peer (_nodeStateOutboundBidirectional nodeState)
                         }
                         where
                         updater map =
                             let map' = Map.delete nonce map
                             in  if Map.null map' then Nothing else Just map'
-                    Local peer Nothing -> nodeState {
-                          _nodeStateOutboundUnidirectional = Map.delete peer (_nodeStateOutboundUnidirectional nodeState)
-                        }
             -- Decrement the live bytes by the total bytes received, and
             -- remove the handler.
             stIncrBytes (handlerProvenancePeer provenance) (-totalBytes) $ _nodeStateStatistics nodeState
@@ -1426,7 +1414,7 @@ withInOutChannel node@Node{nodeEnvironment, nodeState} nodeid@(NodeId peer) acti
     -- before we register, but that's OK, as disconnectFromPeer is forgiving
     -- about this.
     let action' conn = do
-            rec { let provenance = Local peer (Just (nonce, peerDataVar, NT.bundle conn, timeoutPromise, dumpBytes))
+            rec { let provenance = Local peer (nonce, peerDataVar, NT.bundle conn, timeoutPromise, dumpBytes)
                 ; (promise, _) <- spawnHandler nodeState provenance $ do
                       -- It's essential that we only send the handshake SYN inside
                       -- the handler, because at this point the nonce is guaranteed
