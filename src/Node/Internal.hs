@@ -94,7 +94,7 @@ data NodeState peerData m = NodeState {
       -- ^ To generate nonces.
     , _nodeStateOutboundUnidirectional :: !(Map NT.EndPointAddress (SomeHandler m))
       -- ^ Handlers for each locally-initiated unidirectional connection.
-    , _nodeStateOutboundBidirectional  :: !(Map NT.EndPointAddress (Map Nonce (SomeHandler m, ChannelIn m, Int -> m (), SharedExclusiveT m peerData, NT.ConnectionBundle, Promise m (), Bool)))
+    , _nodeStateOutboundBidirectional  :: !(Map NT.EndPointAddress (Map Nonce (SomeHandler m, Maybe BS.ByteString -> m (), Int -> m (), SharedExclusiveT m peerData, NT.ConnectionBundle, Promise m (), Bool)))
       -- ^ Handlers for each nonce which we generated (locally-initiated
       --   bidirectional connections).
       --   The bool indicates whether we have received an ACK for this.
@@ -872,10 +872,10 @@ nodeDispatcher node handlerInOut =
         _ <- modifySharedAtomic nstate $ \st -> do
             let nonceMaps = Map.elems (_nodeStateOutboundBidirectional st)
             let outbounds = nonceMaps >>= Map.elems
-            forM_ outbounds $ \(_, ChannelIn chan, _, peerDataVar, _, _, acked) -> do
+            forM_ outbounds $ \(_, dumpBytes, _, peerDataVar, _, _, acked) -> do
                 when (not acked) $ do
                    _ <- tryPutSharedExclusive peerDataVar (error "no peer data because local node has gone down")
-                   Channel.writeChannel chan Nothing
+                   dumpBytes Nothing
             return (st, ())
 
         _ <- waitForRunningHandlers node
@@ -1102,15 +1102,15 @@ nodeDispatcher node handlerInOut =
                               case thisNonce of
                                   Nothing -> return (st, Nothing)
                                   Just (_, _, _, _, _, _, True) -> return (st, Just Nothing)
-                                  Just (promise, channel, incrBytes, peerDataVar, connBundle, timeoutPromise, False) -> do
+                                  Just (promise, dumpBytes, incrBytes, peerDataVar, connBundle, timeoutPromise, False) -> do
                                       cancel timeoutPromise
                                       return
                                           ( st { _nodeStateOutboundBidirectional = Map.update updater peer (_nodeStateOutboundBidirectional st)
                                                }
-                                          , Just (Just (channel, incrBytes, peerDataVar))
+                                          , Just (Just (dumpBytes, incrBytes, peerDataVar))
                                           )
                                       where
-                                      updater map = Just $ Map.insert nonce (promise, channel, incrBytes, peerDataVar, connBundle, timeoutPromise, True) map
+                                      updater map = Just $ Map.insert nonce (promise, dumpBytes, incrBytes, peerDataVar, connBundle, timeoutPromise, True) map
                           case outcome of
                               -- We don't know about the nonce. Could be that
                               -- we never sent the SYN for it (protocol error)
@@ -1132,9 +1132,8 @@ nodeDispatcher node handlerInOut =
 
                               -- Got an ACK for a SYN that we sent. Start
                               -- feeding the application handler.
-                              Just (Just (ChannelIn channel, incrBytes, peerDataVar)) -> do
+                              Just (Just (dumpBytes, incrBytes, peerDataVar)) -> do
                                   putSharedExclusive peerDataVar peerData
-                                  let dumpBytes mBytes = Channel.writeChannel channel mBytes
                                   let bs = LBS.toStrict ws'
                                   dumpBytes $ Just bs
                                   incrBytes $ fromIntegral (BS.length bs)
@@ -1262,9 +1261,9 @@ nodeDispatcher node handlerInOut =
 
         logWarning $ sformat ("closing " % shown % " channels on bundle " % shown % " to " % shown) (length channelsAndPeerDataVars) bundle peer
 
-        forM_ channelsAndPeerDataVars $ \(ChannelIn chan, peerDataVar) -> do
+        forM_ channelsAndPeerDataVars $ \(dumpBytes, peerDataVar) -> do
             _ <- tryPutSharedExclusive peerDataVar (error "no peer data because the connection was lost")
-            Channel.writeChannel chan Nothing
+            dumpBytes Nothing
 
         return state'
 
@@ -1280,7 +1279,7 @@ spawnHandler
        , WithLogger m
        , MonadFix m )
     => SharedAtomicT m (NodeState peerData m)
-    -> HandlerProvenance peerData m (ChannelIn m)
+    -> HandlerProvenance peerData m (Maybe BS.ByteString -> m ())
     -> m t
     -> m (Promise m t, Int -> m ())
 spawnHandler stateVar provenance action =
@@ -1300,12 +1299,12 @@ spawnHandler stateVar provenance action =
                 Remote _ _ -> nodeState {
                       _nodeStateInbound = Set.insert someHandler (_nodeStateInbound nodeState)
                     }
-                Local peer (Just (nonce, peerDataVar, connBundle, timeoutPromise, channelIn)) -> nodeState {
+                Local peer (Just (nonce, peerDataVar, connBundle, timeoutPromise, dumpBytes)) -> nodeState {
                       _nodeStateOutboundBidirectional = Map.alter alteration peer (_nodeStateOutboundBidirectional nodeState)
                     }
                     where
-                    alteration Nothing = Just $ Map.singleton nonce (someHandler, channelIn, incrBytes, peerDataVar, connBundle, timeoutPromise, False)
-                    alteration (Just map) = Just $ Map.insert nonce (someHandler, channelIn, incrBytes, peerDataVar, connBundle, timeoutPromise, False) map
+                    alteration Nothing = Just $ Map.singleton nonce (someHandler, dumpBytes, incrBytes, peerDataVar, connBundle, timeoutPromise, False)
+                    alteration (Just map) = Just $ Map.insert nonce (someHandler, dumpBytes, incrBytes, peerDataVar, connBundle, timeoutPromise, False) map
                 Local peer Nothing -> nodeState {
                       _nodeStateOutboundUnidirectional = Map.insert peer someHandler (_nodeStateOutboundUnidirectional nodeState)
                     }
@@ -1409,6 +1408,13 @@ withInOutChannel node@Node{nodeEnvironment, nodeState} nodeid@(NodeId peer) acti
                let (nonce, !prng') = random (_nodeStateGen nodeState)
                pure (nodeState { _nodeStateGen = prng' }, nonce)
     channel <- fmap ChannelIn Channel.newChannel
+    -- A mutable cell for the channel. We'll swap it to Nothing when we don't
+    -- want to accept any more bytes (the handler has finished).
+    channelVar <- newSharedAtomic (Just channel)
+    let dumpBytes mbs = withSharedAtomic channelVar $ \mchannel -> case mchannel of
+            Nothing -> pure ()
+            Just (ChannelIn channel) -> Channel.writeChannel channel mbs
+        closeChannel = modifySharedAtomic channelVar $ \_ -> pure (Nothing, ())
     -- The dispatcher will fill in the peer data as soon as it's available.
     -- TODO must ensure that at some point it is always filled. What if the
     -- peer never responds? All we can do is time-out I suppose.
@@ -1420,7 +1426,7 @@ withInOutChannel node@Node{nodeEnvironment, nodeState} nodeid@(NodeId peer) acti
     -- before we register, but that's OK, as disconnectFromPeer is forgiving
     -- about this.
     let action' conn = do
-            rec { let provenance = Local peer (Just (nonce, peerDataVar, NT.bundle conn, timeoutPromise, channel))
+            rec { let provenance = Local peer (Just (nonce, peerDataVar, NT.bundle conn, timeoutPromise, dumpBytes))
                 ; (promise, _) <- spawnHandler nodeState provenance $ do
                       -- It's essential that we only send the handshake SYN inside
                       -- the handler, because at this point the nonce is guaranteed
@@ -1445,7 +1451,7 @@ withInOutChannel node@Node{nodeEnvironment, nodeState} nodeid@(NodeId peer) acti
                 }
             wait promise
     bracket (connectToPeer node nodeid)
-            (\conn -> disconnectFromPeer node nodeid conn)
+            (\conn -> disconnectFromPeer node nodeid conn >> closeChannel)
             action'
 
 data OutboundConnectionState m =
