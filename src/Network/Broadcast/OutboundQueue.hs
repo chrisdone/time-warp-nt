@@ -25,8 +25,6 @@ module Network.Broadcast.OutboundQueue (
     -- ** Enqueueing policy
   , Precedence(..)
   , MaxAhead(..)
-  , MaxQueueSize(..)
-  , Fallback(..)
   , Enqueue(..)
   , EnqueuePolicy
   , defaultEnqueuePolicy
@@ -63,10 +61,14 @@ import Control.Concurrent.Async
 import Control.Exception
 import Control.Lens
 import Control.Monad
+import Control.Monad.IO.Class
 import Data.Map.Strict (Map)
+import Data.Maybe (catMaybes)
 import Data.Monoid ((<>))
 import Data.Set (Set)
-import System.Random (randomRIO)
+import Data.Text (Text)
+import Formatting (sformat, (%), shown)
+import System.Wlog.CanLog
 import qualified Data.Map.Strict as Map
 import qualified Data.Set        as Set
 
@@ -102,6 +104,7 @@ data Peers nid = Peers {
     , _peersRelay :: AllOf (Alts nid)
     , _peersEdge  :: AllOf (Alts nid)
     }
+  deriving (Show)
 
 -- | Each of these need to be contacted (in arbitrary order)
 type AllOf a = [a]
@@ -148,7 +151,7 @@ removePeers nids peers =
     remove = map $ filter (`Set.notMember` nids)
 
 {-------------------------------------------------------------------------------
-  Enqueing policy
+  Enqueueing policy
 
   The enquing policy is intended to guarantee that at the point of enqueing
   we can be reasonably sure that the message will get to where it needs to be
@@ -160,28 +163,14 @@ removePeers nids peers =
 -- This is the total number of messages currently in-flight or in-queue with a
 -- precedence at or above the message to be enqueued (i.e., all messages that
 -- will be handled before the new message).
-newtype MaxAhead = MaxAhead Int
-
--- | Maximum queue size
 --
--- If we cannot find an alternative satisfying 'MaxAhead' and fall back to a
--- random alternative, 'MaxQueueSize' will determine whether we first need to
--- drop an old message before enqueing the new message (to keep the queue size
--- bounded).
-data MaxQueueSize = MaxQueueSize Int
-
--- | What to do if we couldn't pick a node?
-data Fallback =
-    -- | Pick a random alternative
-    FallbackRandom MaxQueueSize
-
-    -- | Don't send the message at all
-  | FallbackNone
+-- If we cannot find any alternative that doesn't match requirements we simply
+-- give up on (this list of) alternatives.
+newtype MaxAhead = MaxAhead Int
 
 data Enqueue = Enqueue {
       enqNodeType   :: NodeType
     , enqMaxAhead   :: MaxAhead
-    , enqFallback   :: Fallback
     , enqPrecedence :: Precedence
     }
 
@@ -206,15 +195,15 @@ defaultEnqueuePolicy NodeCore = go
     -- Enqueue policy for core nodes
     go :: EnqueuePolicy
     go MsgBlockHeader _ = [
-        Enqueue NodeCore  (MaxAhead 0) (FallbackRandom (MaxQueueSize 1)) P1
-      , Enqueue NodeRelay (MaxAhead 0) (FallbackRandom (MaxQueueSize 1)) P3
+        Enqueue NodeCore  (MaxAhead 0) P1
+      , Enqueue NodeRelay (MaxAhead 0) P3
       ]
     go MsgMPC _ = [
-        Enqueue NodeCore (MaxAhead 1) (FallbackRandom (MaxQueueSize 2)) P2
+        Enqueue NodeCore (MaxAhead 1) P2
         -- not sent to relay nodes
       ]
     go MsgTransaction _ = [
-        Enqueue NodeCore (MaxAhead 20) (FallbackRandom (MaxQueueSize 20)) P4
+        Enqueue NodeCore (MaxAhead 20) P4
         -- not sent to relay nodes
       ]
 defaultEnqueuePolicy NodeRelay = go
@@ -222,13 +211,13 @@ defaultEnqueuePolicy NodeRelay = go
     -- Enqueue policy for relay nodes
     go :: EnqueuePolicy
     go MsgBlockHeader _ = [
-        Enqueue NodeRelay (MaxAhead 0) (FallbackRandom (MaxQueueSize 1)) P1
-      , Enqueue NodeCore  (MaxAhead 0) (FallbackRandom (MaxQueueSize 1)) P2
-      , Enqueue NodeEdge  (MaxAhead 0) (FallbackRandom (MaxQueueSize 1)) P3
+        Enqueue NodeRelay (MaxAhead 0) P1
+      , Enqueue NodeCore  (MaxAhead 0) P2
+      , Enqueue NodeEdge  (MaxAhead 0) P3
       ]
     go MsgTransaction _ = [
-        Enqueue NodeCore  (MaxAhead 20) (FallbackRandom (MaxQueueSize 20)) P4
-      , Enqueue NodeRelay (MaxAhead 20) (FallbackRandom (MaxQueueSize 20)) P5
+        Enqueue NodeCore  (MaxAhead 20) P4
+      , Enqueue NodeRelay (MaxAhead 20) P5
         -- transactions not forwarded to edge nodes
       ]
     go MsgMPC _ = [
@@ -239,7 +228,7 @@ defaultEnqueuePolicy NodeEdge = go
     -- Enqueue policy for edge nodes
     go :: EnqueuePolicy
     go MsgTransaction OriginSender = [
-        Enqueue NodeRelay (MaxAhead 0) (FallbackRandom (MaxQueueSize 100)) P1
+        Enqueue NodeRelay (MaxAhead 0) P1
       ]
     go MsgTransaction OriginForward = [
         -- don't forward transactions that weren't created at this node
@@ -405,7 +394,12 @@ delInFlight inFlight nid tid = applyMVar_ inFlight $ Map.alter aux nid
   Initialization
 -------------------------------------------------------------------------------}
 
-data OutboundQ msg nid = (ClassifyMsg msg, ClassifyNode nid, Ord nid) => OutQ {
+data OutboundQ msg nid = ( ClassifyMsg msg
+                         , ClassifyNode nid
+                         , Ord nid
+                         , Show nid
+                         , Show msg
+                         ) => OutQ {
       -- | Enqueuing policy
       qEnqueuePolicy :: EnqueuePolicy
 
@@ -440,7 +434,7 @@ data OutboundQ msg nid = (ClassifyMsg msg, ClassifyNode nid, Ord nid) => OutQ {
 -- | Initialize the outbound queue
 --
 -- NOTE: The dequeuing thread must be started separately. See 'dequeueThread'.
-new :: (ClassifyMsg msg, ClassifyNode nid, Ord nid)
+new :: (ClassifyMsg msg, ClassifyNode nid, Ord nid, Show nid, Show msg)
     => EnqueuePolicy -> DequeuePolicy -> FailurePolicy -> IO (OutboundQ msg nid)
 new qEnqueuePolicy qDequeuePolicy qFailurePolicy = do
     qInFlight  <- newMVar Map.empty
@@ -465,38 +459,46 @@ new qEnqueuePolicy qDequeuePolicy qFailurePolicy = do
 -------------------------------------------------------------------------------}
 
 -- TODO: Don't send to same node twice
-intEnqueue :: OutboundQ msg nid -> msg -> Origin -> Peers nid -> IO ()
+intEnqueue :: forall m msg nid. (MonadIO m, WithLogger m)
+           => OutboundQ msg nid -> msg -> Origin -> Peers nid -> m ()
 intEnqueue outQ@OutQ{..} msg origin peers =
-    forM_ (qEnqueuePolicy (classifyMsg msg) origin) $ \enq@Enqueue{..} ->
-      forM_ (peers ^. peersOfType enqNodeType) $ \alts -> do
-        mAlt <- pickAlt outQ enq alts `orElseM` pickFallback outQ enq alts
+    forM_ (qEnqueuePolicy (classifyMsg msg) origin) $ \enq@Enqueue{..} -> do
+      sentTo <- forM (peers ^. peersOfType enqNodeType) $ \alts -> do
+        mAlt <- liftIO $ pickAlt outQ enq alts
         case mAlt of
-          Nothing  -> return () -- Drop message
-          Just alt -> do mqEnqueue qScheduled (Packet msg alt) enqPrecedence
-                         poke qSignal
+          Nothing  -> logWarning $ noAlt alts
+          Just alt -> liftIO $ do
+            mqEnqueue qScheduled (Packet msg alt) enqPrecedence
+            poke qSignal
+        return mAlt
+      when (null (catMaybes sentTo :: [nid])) $
+        logError msgLost
+  where
+    noAlt :: [nid] -> Text
+    noAlt = sformat ("Could not choose suitable alternative from " % shown)
+
+    msgLost :: Text
+    msgLost = sformat ( "Failed to send message "
+                      % shown
+                      % " with origin "
+                      % shown
+                      % " to peers "
+                      % shown
+                      )
+                      msg
+                      origin
+                      peers
 
 pickAlt :: OutboundQ msg nid -> Enqueue -> Alts nid -> IO (Maybe nid)
 pickAlt outQ Enqueue{enqMaxAhead = MaxAhead maxAhead, ..} alts =
     foldr1 orElseM [ do
         failure <- hasRecentFailure outQ alt
         ahead   <- currentlyAhead outQ alt enqPrecedence
-        return $ if not failure && ahead < maxAhead
+        return $ if not failure && ahead <= maxAhead
                    then Just alt
                    else Nothing
       | alt <- alts
       ]
-
-pickFallback :: OutboundQ msg nid -> Enqueue -> Alts nid -> IO (Maybe nid)
-pickFallback OutQ{..} Enqueue{..} alts =
-    case enqFallback of
-      FallbackNone ->
-        return Nothing
-      FallbackRandom (MaxQueueSize maxQueueSize) -> do
-        alt <- (alts !!) <$> randomRIO (0, length alts - 1)
-        queueSize <- MQ.sizeBy (KeyByDestPrec alt enqPrecedence) qScheduled
-        when (queueSize >= maxQueueSize) $
-          MQ.removeFront (KeyByDestPrec alt enqPrecedence) qScheduled
-        return (Just alt)
 
 -- | Check how many messages are currently ahead
 --
@@ -584,6 +586,8 @@ intDequeue outQ@OutQ{..} sendMsg = do
 --
 -- NOTE: Since we don't send messages to nodes listed in failures, we can
 -- assume that there isn't an existing failure here.
+--
+-- TODO: Reduce the time of the actual send from
 intFailure :: OutboundQ msg nid -> Packet msg nid -> SomeException -> IO ()
 intFailure OutQ{..} Packet{..} err =
     forkThread Thread {
@@ -624,6 +628,7 @@ data Origin =
 
     -- | It originated elsewhere; we're just forwarding it
   | OriginForward
+  deriving (Show)
 
 -- | Queue a message to be send to all peers
 --
@@ -633,13 +638,16 @@ data Origin =
 -- subscription; after all, it's no problem for statically configured nodes to
 -- also subscribe when they are created. We don't use such a model just yet to
 -- make integration easier.
-enqueue :: OutboundQ msg nid
+--
+-- TODO: When we fail to emit a transaction from an edge node, re-enqueue it
+enqueue :: (MonadIO m, WithLogger m)
+        => OutboundQ msg nid
         -> msg        -- ^ Message to send
         -> Origin     -- ^ Origin of this message
         -> Peers nid  -- ^ Additional peers (in addition to subscribers)
-        -> IO ()
+        -> m ()
 enqueue outQ@OutQ{..} msg origin peers' = do
-    peers <- readMVar qPeers
+    peers <- liftIO $ readMVar qPeers
     intEnqueue outQ msg origin (peers <> peers')
 
 {-------------------------------------------------------------------------------
