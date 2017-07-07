@@ -639,7 +639,7 @@ data Origin =
 -- also subscribe when they are created. We don't use such a model just yet to
 -- make integration easier.
 --
--- TODO: When we fail to emit a transaction from an edge node, re-enqueue it
+-- TODO: Offer a synchronous send.
 enqueue :: (MonadIO m, WithLogger m)
         => OutboundQ msg nid
         -> msg        -- ^ Message to send
