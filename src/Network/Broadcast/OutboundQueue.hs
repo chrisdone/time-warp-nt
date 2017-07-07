@@ -25,7 +25,7 @@ module Network.Broadcast.OutboundQueue (
     -- ** Enqueueing policy
   , Precedence(..)
   , MaxAhead(..)
-  , DropOrGrow(..)
+  , MaxQueueSize(..)
   , Fallback(..)
   , Enqueue(..)
   , EnqueuePolicy
@@ -158,23 +158,18 @@ removePeers nids peers =
 -- will be handled before the new message).
 newtype MaxAhead = MaxAhead Int
 
--- | Should we remove an old message from the queue if it is full?
-data DropOrGrow =
-    -- | Drop an old message of the same precedence as the new one
-    --
-    -- NOTE: The limits we impose are on all messages of equal or higher
-    -- precedence (see 'MaxAhead'). This means that by removing a message of
-    -- the /same/ precedence we effectively remove a message that's ahead of
-    -- us with the lowest precedence
-    DropOldest
-
-    -- | Just grow the queue
-  | GrowQueue
+-- | Maximum queue size
+--
+-- If we cannot find an alternative satisfying 'MaxAhead' and fall back to a
+-- random alternative, 'MaxQueueSize' will determine whether we first need to
+-- drop an old message before enqueing the new message (to keep the queue size
+-- bounded).
+data MaxQueueSize = MaxQueueSize Int
 
 -- | What to do if we couldn't pick a node?
 data Fallback =
     -- | Pick a random alternative
-    FallbackRandom DropOrGrow
+    FallbackRandom MaxQueueSize
 
     -- | Don't send the message at all
   | FallbackNone
@@ -193,6 +188,8 @@ data Enqueue = Enqueue {
 -- message. However, it does NOT decide _how many_ alternatives to pick; we
 -- pick one from _each_ of the lists that we are given. It is the responsiblity
 -- of the next layer up to configure these peers as desired.
+--
+-- TODO: Verify the max queue sizes against the updated policy.
 type EnqueuePolicy =
            MsgType  -- ^ Type of the message we want to send
         -> Origin   -- ^ Where did this message originate?
@@ -205,15 +202,15 @@ defaultEnqueuePolicy NodeCore = go
     -- Enqueue policy for core nodes
     go :: EnqueuePolicy
     go MsgBlockHeader _ = [
-        Enqueue NodeCore  (MaxAhead 1) (FallbackRandom DropOldest) P1
-      , Enqueue NodeRelay (MaxAhead 1) (FallbackRandom DropOldest) P3
+        Enqueue NodeCore  (MaxAhead 1) (FallbackRandom (MaxQueueSize 1)) P1
+      , Enqueue NodeRelay (MaxAhead 1) (FallbackRandom (MaxQueueSize 1)) P3
       ]
     go MsgMPC _ = [
-        Enqueue NodeCore (MaxAhead 2) (FallbackRandom DropOldest) P2
+        Enqueue NodeCore (MaxAhead 2) (FallbackRandom (MaxQueueSize 2)) P2
         -- not sent to relay nodes
       ]
     go MsgTransaction _ = [
-        Enqueue NodeCore (MaxAhead 20) (FallbackRandom DropOldest) P4
+        Enqueue NodeCore (MaxAhead 20) (FallbackRandom (MaxQueueSize 20)) P4
         -- not sent to relay nodes
       ]
 defaultEnqueuePolicy NodeRelay = go
@@ -221,13 +218,13 @@ defaultEnqueuePolicy NodeRelay = go
     -- Enqueue policy for relay nodes
     go :: EnqueuePolicy
     go MsgBlockHeader _ = [
-        Enqueue NodeRelay (MaxAhead 1) (FallbackRandom DropOldest) P1
-      , Enqueue NodeCore  (MaxAhead 1) (FallbackRandom DropOldest) P2
-      , Enqueue NodeEdge  (MaxAhead 1) (FallbackRandom DropOldest) P3
+        Enqueue NodeRelay (MaxAhead 1) (FallbackRandom (MaxQueueSize 1)) P1
+      , Enqueue NodeCore  (MaxAhead 1) (FallbackRandom (MaxQueueSize 1)) P2
+      , Enqueue NodeEdge  (MaxAhead 1) (FallbackRandom (MaxQueueSize 1)) P3
       ]
     go MsgTransaction _ = [
-        Enqueue NodeCore  (MaxAhead 20) (FallbackRandom DropOldest) P4
-      , Enqueue NodeRelay (MaxAhead 20) (FallbackRandom DropOldest) P5
+        Enqueue NodeCore  (MaxAhead 20) (FallbackRandom (MaxQueueSize 20)) P4
+      , Enqueue NodeRelay (MaxAhead 20) (FallbackRandom (MaxQueueSize 20)) P5
         -- transactions not forwarded to edge nodes
       ]
     go MsgMPC _ = [
@@ -238,7 +235,7 @@ defaultEnqueuePolicy NodeEdge = go
     -- Enqueue policy for edge nodes
     go :: EnqueuePolicy
     go MsgTransaction OriginSender = [
-        Enqueue NodeRelay (MaxAhead 1) (FallbackRandom GrowQueue) P1
+        Enqueue NodeRelay (MaxAhead 1) (FallbackRandom (MaxQueueSize 100)) P1
       ]
     go MsgTransaction OriginForward = [
         -- don't forward transactions that weren't created at this node
@@ -461,13 +458,11 @@ pickFallback OutQ{..} Enqueue{..} alts =
     case enqFallback of
       FallbackNone ->
         return Nothing
-      FallbackRandom dropOrGrow -> do
+      FallbackRandom (MaxQueueSize maxQueueSize) -> do
         alt <- (alts !!) <$> randomRIO (0, length alts - 1)
-        case dropOrGrow of
-          GrowQueue ->
-            return ()
-          DropOldest ->
-            MQ.removeFront (KeyByDestPrec alt enqPrecedence) qScheduled
+        queueSize <- MQ.sizeBy (KeyByDestPrec alt enqPrecedence) qScheduled
+        when (queueSize >= maxQueueSize) $
+          MQ.removeFront (KeyByDestPrec alt enqPrecedence) qScheduled
         return (Just alt)
 
 -- | Check how many messages are currently ahead
