@@ -89,6 +89,7 @@ newDemoQ :: NodeType -> IO DemoQ
 newDemoQ selfType = do
     demoQ <- OutQ.new (OutQ.defaultEnqueuePolicy selfType)
                       (OutQ.defaultDequeuePolicy selfType)
+                      (OutQ.defaultFailurePolicy selfType)
     _tid  <- forkIO $ OutQ.dequeueThread demoQ sendMsg
     return demoQ
   where

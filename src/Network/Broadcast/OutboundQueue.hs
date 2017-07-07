@@ -36,6 +36,10 @@ module Network.Broadcast.OutboundQueue (
   , Dequeue(..)
   , DequeuePolicy
   , defaultDequeuePolicy
+    -- ** Failure policy
+  , FailurePolicy
+  , ReconsiderAfter(..)
+  , defaultFailurePolicy
     -- * Enqueueing
   , Origin(..)
   , enqueue
@@ -202,11 +206,11 @@ defaultEnqueuePolicy NodeCore = go
     -- Enqueue policy for core nodes
     go :: EnqueuePolicy
     go MsgBlockHeader _ = [
-        Enqueue NodeCore  (MaxAhead 1) (FallbackRandom (MaxQueueSize 1)) P1
-      , Enqueue NodeRelay (MaxAhead 1) (FallbackRandom (MaxQueueSize 1)) P3
+        Enqueue NodeCore  (MaxAhead 0) (FallbackRandom (MaxQueueSize 1)) P1
+      , Enqueue NodeRelay (MaxAhead 0) (FallbackRandom (MaxQueueSize 1)) P3
       ]
     go MsgMPC _ = [
-        Enqueue NodeCore (MaxAhead 2) (FallbackRandom (MaxQueueSize 2)) P2
+        Enqueue NodeCore (MaxAhead 1) (FallbackRandom (MaxQueueSize 2)) P2
         -- not sent to relay nodes
       ]
     go MsgTransaction _ = [
@@ -218,9 +222,9 @@ defaultEnqueuePolicy NodeRelay = go
     -- Enqueue policy for relay nodes
     go :: EnqueuePolicy
     go MsgBlockHeader _ = [
-        Enqueue NodeRelay (MaxAhead 1) (FallbackRandom (MaxQueueSize 1)) P1
-      , Enqueue NodeCore  (MaxAhead 1) (FallbackRandom (MaxQueueSize 1)) P2
-      , Enqueue NodeEdge  (MaxAhead 1) (FallbackRandom (MaxQueueSize 1)) P3
+        Enqueue NodeRelay (MaxAhead 0) (FallbackRandom (MaxQueueSize 1)) P1
+      , Enqueue NodeCore  (MaxAhead 0) (FallbackRandom (MaxQueueSize 1)) P2
+      , Enqueue NodeEdge  (MaxAhead 0) (FallbackRandom (MaxQueueSize 1)) P3
       ]
     go MsgTransaction _ = [
         Enqueue NodeCore  (MaxAhead 20) (FallbackRandom (MaxQueueSize 20)) P4
@@ -235,7 +239,7 @@ defaultEnqueuePolicy NodeEdge = go
     -- Enqueue policy for edge nodes
     go :: EnqueuePolicy
     go MsgTransaction OriginSender = [
-        Enqueue NodeRelay (MaxAhead 1) (FallbackRandom (MaxQueueSize 100)) P1
+        Enqueue NodeRelay (MaxAhead 0) (FallbackRandom (MaxQueueSize 100)) P1
       ]
     go MsgTransaction OriginForward = [
         -- don't forward transactions that weren't created at this node
@@ -294,6 +298,26 @@ defaultDequeuePolicy NodeEdge = go
     go NodeCore  = error "defaultDequeuePolicy: edge to core not applicable"
     go NodeRelay = Dequeue (MaxMsgPerSec 1) (MaxInFlight 1)
     go NodeEdge  = error "defaultDequeuePolicy: edge to edge not applicable"
+
+{-------------------------------------------------------------------------------
+  Failure policy
+-------------------------------------------------------------------------------}
+
+-- | The failure policy determines what happens when a failure occurs as we send
+-- a message to a particular node: how long (in sec) should we wait until we
+-- consider this node to be a viable alternative again?
+type FailurePolicy = NodeType -> MsgType -> SomeException -> ReconsiderAfter
+
+-- | How long (in sec) after a failure should we reconsider this node again for
+-- new messages?
+newtype ReconsiderAfter = ReconsiderAfter Int
+
+-- | Default failure policy
+--
+-- TODO: Implement proper policy
+defaultFailurePolicy :: NodeType -- ^ Our node type
+                     -> FailurePolicy
+defaultFailurePolicy _ourType _theirType _msgType _err = ReconsiderAfter 200
 
 {-------------------------------------------------------------------------------
   Thin wrapper around ConcurrentMultiQueue
@@ -361,16 +385,14 @@ type MsgHandler = Async ()
 type InFlight nid = Map nid (Map ThreadId MsgHandler)
 
 addInFlight :: Ord nid => MVar (InFlight nid) -> nid -> MsgHandler -> IO ()
-addInFlight vInFlight nid handler = modifyMVar_ vInFlight $ \inFlight ->
-    return $! Map.alter aux nid inFlight
+addInFlight inFlight nid handler = applyMVar_ inFlight $ Map.alter aux nid
   where
     aux :: Maybe (Map ThreadId MsgHandler) -> Maybe (Map ThreadId MsgHandler)
     aux Nothing   = Just $ Map.singleton (asyncThreadId handler) handler
     aux (Just ts) = Just $ Map.insert (asyncThreadId handler) handler ts
 
 delInFlight :: Ord nid => MVar (InFlight nid) -> nid -> ThreadId -> IO ()
-delInFlight vInFlight nid tid = modifyMVar_ vInFlight $ \inFlight ->
-    return $! Map.alter aux nid inFlight
+delInFlight inFlight nid tid = applyMVar_ inFlight $ Map.alter aux nid
   where
     aux :: Maybe (Map ThreadId MsgHandler) -> Maybe (Map ThreadId MsgHandler)
     aux Nothing   = error "delInFlight: already deleted"
@@ -390,6 +412,9 @@ data OutboundQ msg nid = (ClassifyMsg msg, ClassifyNode nid, Ord nid) => OutQ {
       -- | Dequeueing policy
     , qDequeuePolicy :: DequeuePolicy
 
+      -- | Failure policy
+    , qFailurePolicy :: FailurePolicy
+
       -- | Messages sent but not yet acknowledged
     , qInFlight :: MVar (InFlight nid)
 
@@ -398,6 +423,12 @@ data OutboundQ msg nid = (ClassifyMsg msg, ClassifyNode nid, Ord nid) => OutQ {
 
       -- | Known peers
     , qPeers :: MVar (Peers nid)
+
+      -- | Track communication failures
+      --
+      -- When an error occurs we record it in this map and spawn a thread that
+      -- removes the error again after a delay specified by the failure policy.
+    , qFailures :: MVar (Map nid (Maybe (Async ())))
 
       -- | Used to send control messages to the main thread
     , qCtrlMsg :: MVar CtrlMsg
@@ -410,12 +441,13 @@ data OutboundQ msg nid = (ClassifyMsg msg, ClassifyNode nid, Ord nid) => OutQ {
 --
 -- NOTE: The dequeuing thread must be started separately. See 'dequeueThread'.
 new :: (ClassifyMsg msg, ClassifyNode nid, Ord nid)
-    => EnqueuePolicy -> DequeuePolicy -> IO (OutboundQ msg nid)
-new qEnqueuePolicy qDequeuePolicy = do
+    => EnqueuePolicy -> DequeuePolicy -> FailurePolicy -> IO (OutboundQ msg nid)
+new qEnqueuePolicy qDequeuePolicy qFailurePolicy = do
     qInFlight  <- newMVar Map.empty
     qScheduled <- MQ.new
     qPeers     <- newMVar mempty
     qCtrlMsg   <- newEmptyMVar
+    qFailures  <- newMVar Map.empty
 
     -- Only look for control messages when the queue is empty
     let checkCtrlMsg :: IO (Maybe CtrlMsg)
@@ -433,8 +465,8 @@ new qEnqueuePolicy qDequeuePolicy = do
 -------------------------------------------------------------------------------}
 
 -- TODO: Don't send to same node twice
-rsEnqueue :: OutboundQ msg nid -> msg -> Origin -> Peers nid -> IO ()
-rsEnqueue outQ@OutQ{..} msg origin peers =
+intEnqueue :: OutboundQ msg nid -> msg -> Origin -> Peers nid -> IO ()
+intEnqueue outQ@OutQ{..} msg origin peers =
     forM_ (qEnqueuePolicy (classifyMsg msg) origin) $ \enq@Enqueue{..} ->
       forM_ (peers ^. peersOfType enqNodeType) $ \alts -> do
         mAlt <- pickAlt outQ enq alts `orElseM` pickFallback outQ enq alts
@@ -446,8 +478,9 @@ rsEnqueue outQ@OutQ{..} msg origin peers =
 pickAlt :: OutboundQ msg nid -> Enqueue -> Alts nid -> IO (Maybe nid)
 pickAlt outQ Enqueue{enqMaxAhead = MaxAhead maxAhead, ..} alts =
     foldr1 orElseM [ do
-        ahead <- currentlyAhead outQ alt enqPrecedence
-        return $ if ahead < maxAhead
+        failure <- hasRecentFailure outQ alt
+        ahead   <- currentlyAhead outQ alt enqPrecedence
+        return $ if not failure && ahead < maxAhead
                    then Just alt
                    else Nothing
       | alt <- alts
@@ -486,15 +519,15 @@ checkMaxInFlight dequeuePolicy inFlight nid =
   where
     MaxInFlight n = deqMaxInFlight (dequeuePolicy (classifyNode nid))
 
-delay :: ClassifyNode nid => DequeuePolicy -> nid -> IO ()
-delay dequeuePolicy nid =
+applyRateLimit :: ClassifyNode nid => DequeuePolicy -> nid -> IO ()
+applyRateLimit dequeuePolicy nid =
     case deqRateLimit (dequeuePolicy (classifyNode nid)) of
       NoRateLimiting -> return ()
       MaxMsgPerSec n -> threadDelay (1000000 `div` n)
 
-rsDequeue :: forall msg nid.
-             OutboundQ msg nid -> SendMsg msg nid -> IO (Maybe CtrlMsg)
-rsDequeue OutQ{..} sendMsg = do
+intDequeue :: forall msg nid.
+              OutboundQ msg nid -> SendMsg msg nid -> IO (Maybe CtrlMsg)
+intDequeue outQ@OutQ{..} sendMsg = do
     mPacket <- getPacket
     case mPacket of
       Left ctrlMsg -> return $ Just ctrlMsg
@@ -509,8 +542,8 @@ rsDequeue OutQ{..} sendMsg = do
     --
     -- At this point we have dequeued the message but not yet recorded it as
     -- in-flight. That's okay though: the only function whose behaviour is
-    -- affected by 'rsInFlight' is 'rsDequeue', the main thread (this thread) is
-    -- the only thread calling 'rsDequeue', and we will update 'rsInFlight'
+    -- affected by 'rsInFlight' is 'intDequeue', the main thread (this thread) is
+    -- the only thread calling 'intDequeue', and we will update 'rsInFlight'
     -- before dequeueing the next message.
     --
     -- We start a new thread to handle the conversation. This is a bit of a
@@ -526,25 +559,52 @@ rsDequeue OutQ{..} sendMsg = do
     -- will be able to solve this conumdrum properly once we move away from TCP
     -- and use the RINA network architecture instead.
     sendPacket :: Packet msg nid -> IO ()
-    sendPacket packet@Packet{dest} = mask_ $ do
-      barrier <- newEmptyMVar
-      handler <- asyncWithUnmask $ sendThread barrier packet
-      addInFlight qInFlight dest handler
-      putMVar barrier () -- Only start aux thread after registration
+    sendPacket packet@Packet{dest} =
+      forkThread Thread {
+          threadRegister   = addInFlight qInFlight dest
+        , threadUnregister = delInFlight qInFlight dest
+        , threadBody       = sendThread packet
+        }
 
-    sendThread :: MVar () -> Packet msg nid -> (IO () -> IO ()) -> IO ()
-    sendThread barrier Packet{..} unmask = do
-      -- wait for go-ahead
-      readMVar barrier
-      -- Discard any errors thrown by the callback
-      _mErr <- catchAll $ unmask $ do
+    sendThread :: Packet msg nid -> Unmask -> IO ()
+    sendThread packet@Packet{..} unmask = do
+      mErr <- try $ unmask $ do
         sendMsg payload dest
-        delay qDequeuePolicy dest
-      delInFlight qInFlight dest =<< myThreadId
+        applyRateLimit qDequeuePolicy dest
+      case mErr of
+        Left err -> intFailure outQ packet err
+        Right () -> return ()
       poke qSignal
 
-    catchAll :: IO () -> IO (Either SomeException ())
-    catchAll = try
+{-------------------------------------------------------------------------------
+  Interpreter for failure policy
+-------------------------------------------------------------------------------}
+
+-- | What do we know when sending a message fails?
+--
+-- NOTE: Since we don't send messages to nodes listed in failures, we can
+-- assume that there isn't an existing failure here.
+intFailure :: OutboundQ msg nid -> Packet msg nid -> SomeException -> IO ()
+intFailure OutQ{..} Packet{..} err =
+    forkThread Thread {
+        threadRegister   = recordErr
+      , threadUnregister = unrecordErr
+      , threadBody       = \unmask -> unmask $ threadDelay (delay * 1000000)
+      }
+  where
+    delay :: Int
+    ReconsiderAfter delay = qFailurePolicy (classifyNode dest)
+                                           (classifyMsg payload)
+                                           err
+
+    recordErr :: Async () -> IO ()
+    recordErr thread = applyMVar_ qFailures $ Map.insert dest (Just thread)
+
+    unrecordErr :: ThreadId -> IO ()
+    unrecordErr _tid = applyMVar_ qFailures $ Map.delete dest
+
+hasRecentFailure :: OutboundQ msg nid -> nid -> IO Bool
+hasRecentFailure OutQ{..} nid = Map.member nid <$> readMVar qFailures
 
 {-------------------------------------------------------------------------------
   Public interface to enqueing
@@ -580,7 +640,7 @@ enqueue :: OutboundQ msg nid
         -> IO ()
 enqueue outQ@OutQ{..} msg origin peers' = do
     peers <- readMVar qPeers
-    rsEnqueue outQ msg origin (peers <> peers')
+    intEnqueue outQ msg origin (peers <> peers')
 
 {-------------------------------------------------------------------------------
   Dequeue thread
@@ -607,7 +667,7 @@ dequeueThread outQ@OutQ{..} sendMsg =
   where
     loop :: IO ()
     loop = do
-      mCtrlMsg <- rsDequeue outQ sendMsg
+      mCtrlMsg <- intDequeue outQ sendMsg
       case mCtrlMsg of
         Nothing      -> loop
         Just ctrlMsg -> do
@@ -669,9 +729,7 @@ flush OutQ{..} = do
 -- edge node disappears the listener thread on the relay node should call
 -- 'unsubscribe' to remove the edge node from its outbound queue again.
 subscribe :: OutboundQ msg nid -> Peers nid -> IO ()
-subscribe OutQ{..} peers' =
-    modifyMVar_ qPeers $ \peers ->
-      return $! peers <> peers'
+subscribe OutQ{..} peers' = applyMVar_ qPeers (<> peers')
 
 -- | Unsubscribe some nodes
 --
@@ -679,9 +737,30 @@ subscribe OutQ{..} peers' =
 --
 -- TODO: Delete now-useless outbound messages from the queues.
 unsubscribe :: Ord nid => OutboundQ msg nid -> [nid] -> IO ()
-unsubscribe OutQ{..} nids =
-    modifyMVar_ qPeers $ \peers ->
-      return $! removePeers (Set.fromList nids) peers
+unsubscribe OutQ{..} = applyMVar_ qPeers . removePeers . Set.fromList
+
+{-------------------------------------------------------------------------------
+  Auxiliary: starting and registering threads
+-------------------------------------------------------------------------------}
+
+type Unmask = forall a. IO a -> IO a
+
+data Thread = Thread {
+      threadRegister   :: Async () -> IO ()
+    , threadUnregister :: ThreadId -> IO ()
+    , threadBody       :: Unmask   -> IO ()
+    }
+
+-- | Fork a new thread, taking care of registration and unregistration
+forkThread :: Thread -> IO ()
+forkThread Thread{..} = mask_ $ do
+    barrier <- newEmptyMVar
+    thread  <- asyncWithUnmask $ \unmask -> do
+                 tid <- myThreadId
+                 takeMVar barrier
+                 threadBody unmask `finally` threadUnregister tid
+    threadRegister thread
+    putMVar barrier ()
 
 {-------------------------------------------------------------------------------
   Auxiliary: Signalling
@@ -740,3 +819,6 @@ retryIfNothing Signal{..} act = go
 
 orElseM :: IO (Maybe a) -> IO (Maybe a) -> IO (Maybe a)
 orElseM f g = f >>= maybe g (return . Just)
+
+applyMVar_ :: MVar a -> (a -> a) -> IO ()
+applyMVar_ mv f = modifyMVar_ mv $ \a -> return $! f a
