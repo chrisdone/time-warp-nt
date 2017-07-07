@@ -31,9 +31,9 @@ module Network.Broadcast.OutboundQueue (
   , EnqueuePolicy
   , defaultEnqueuePolicy
     -- ** Dequeueing policy
-  , Dequeue(..)
-  , Delay(..)
+  , RateLimit(..)
   , MaxInFlight(..)
+  , Dequeue(..)
   , DequeuePolicy
   , defaultDequeuePolicy
     -- * Enqueueing
@@ -74,16 +74,12 @@ import qualified Network.Broadcast.OutboundQueue.ConcurrentMultiQueue as MQ
   Precedence levels
 -------------------------------------------------------------------------------}
 
--- | Precedence levels (from low to high)
+-- | Precedence levels
 --
--- NOTE: Although block announcements are currently routed through the outbound
--- queue, the actual downloading of blocks and well as header negotation (when a
--- node is informed about a block that does not fit its current tip) are not.
-data Precedence =
-    TransactionToCoreNode
-  | BlockToEdgeNode
-  | MpcToCoreNode
-  | BlockToCoreNode
+-- These precedence levels are not given meaningful names because the same kind
+-- of message might be given different precedence levels on different kinds of
+-- nodes. Meaning is given to these levels in the enqueueing policy.
+data Precedence = P1 | P2 | P3 | P4 | P5
   deriving (Show, Eq, Ord, Enum, Bounded)
 
 enumPrecLowestFirst :: [Precedence]
@@ -190,6 +186,13 @@ data Enqueue = Enqueue {
     , enqPrecedence :: Precedence
     }
 
+-- | The enqueuing policy
+--
+-- The enqueueing policy decides what kind of peer to send each message to,
+-- how to pick alternatives, and which precedence level to assign to the
+-- message. However, it does NOT decide _how many_ alternatives to pick; we
+-- pick one from _each_ of the lists that we are given. It is the responsiblity
+-- of the next layer up to configure these peers as desired.
 type EnqueuePolicy =
            MsgType  -- ^ Type of the message we want to send
         -> Origin   -- ^ Where did this message originate?
@@ -199,20 +202,53 @@ defaultEnqueuePolicy :: NodeType       -- ^ Type of this node
                      -> EnqueuePolicy
 defaultEnqueuePolicy NodeCore = go
   where
+    -- Enqueue policy for core nodes
     go :: EnqueuePolicy
     go MsgBlockHeader _ = [
-        Enqueue NodeCore  (MaxAhead 1) (FallbackRandom DropOldest) BlockToCoreNode
-      , Enqueue NodeRelay (MaxAhead 1) (FallbackRandom DropOldest) BlockToEdgeNode
+        Enqueue NodeCore  (MaxAhead 1) (FallbackRandom DropOldest) P1
+      , Enqueue NodeRelay (MaxAhead 1) (FallbackRandom DropOldest) P3
       ]
     go MsgMPC _ = [
-        Enqueue NodeCore (MaxAhead 20) (FallbackRandom DropOldest) MpcToCoreNode
+        Enqueue NodeCore (MaxAhead 2) (FallbackRandom DropOldest) P2
         -- not sent to relay nodes
       ]
     go MsgTransaction _ = [
-        Enqueue NodeCore (MaxAhead 40) (FallbackRandom DropOldest) TransactionToCoreNode
+        Enqueue NodeCore (MaxAhead 20) (FallbackRandom DropOldest) P4
         -- not sent to relay nodes
       ]
-defaultEnqueuePolicy _ = error "TODO: rest of enqueue policy"
+defaultEnqueuePolicy NodeRelay = go
+  where
+    -- Enqueue policy for relay nodes
+    go :: EnqueuePolicy
+    go MsgBlockHeader _ = [
+        Enqueue NodeRelay (MaxAhead 1) (FallbackRandom DropOldest) P1
+      , Enqueue NodeCore  (MaxAhead 1) (FallbackRandom DropOldest) P2
+      , Enqueue NodeEdge  (MaxAhead 1) (FallbackRandom DropOldest) P3
+      ]
+    go MsgTransaction _ = [
+        Enqueue NodeCore  (MaxAhead 20) (FallbackRandom DropOldest) P4
+      , Enqueue NodeRelay (MaxAhead 20) (FallbackRandom DropOldest) P5
+        -- transactions not forwarded to edge nodes
+      ]
+    go MsgMPC _ = [
+        -- Relay nodes never sent any MPC messages to anyone
+      ]
+defaultEnqueuePolicy NodeEdge = go
+  where
+    -- Enqueue policy for edge nodes
+    go :: EnqueuePolicy
+    go MsgTransaction OriginSender = [
+        Enqueue NodeRelay (MaxAhead 1) (FallbackRandom GrowQueue) P1
+      ]
+    go MsgTransaction OriginForward = [
+        -- don't forward transactions that weren't created at this node
+      ]
+    go MsgBlockHeader _ = [
+        -- not forwarded
+      ]
+    go MsgMPC _ = [
+        -- not relevant
+      ]
 
 {-------------------------------------------------------------------------------
   Dequeue policy
@@ -220,14 +256,14 @@ defaultEnqueuePolicy _ = error "TODO: rest of enqueue policy"
 
 data Dequeue = Dequeue {
       -- | Delay before sending the next message (to this node)
-      deqDelay :: Delay
+      deqRateLimit :: RateLimit
 
       -- | Maximum number of in-flight messages (to this node node)
     , deqMaxInFlight :: MaxInFlight
     }
 
--- | Delay between sending messages
-data Delay = NoRateLimiting | Delay Int
+-- | Rate limiting
+data RateLimit = NoRateLimiting | MaxMsgPerSec Int
 
 -- | Maximum number of in-flight messages (for latency hiding)
 newtype MaxInFlight = MaxInFlight Int
@@ -242,11 +278,25 @@ defaultDequeuePolicy :: NodeType -- ^ Our node type
                      -> DequeuePolicy
 defaultDequeuePolicy NodeCore = go
   where
+    -- Dequeueing policy for core nodes
     go :: DequeuePolicy
-    go NodeCore  = Dequeue NoRateLimiting (MaxInFlight 3)
-    go NodeRelay = Dequeue NoRateLimiting (MaxInFlight 3)
-    go NodeEdge  = error "defaultDequeuePolicy: not applicable"
-defaultDequeuePolicy _ = error "TODO: rest of dequeue policy"
+    go NodeCore  = Dequeue NoRateLimiting (MaxInFlight 2)
+    go NodeRelay = Dequeue NoRateLimiting (MaxInFlight 1)
+    go NodeEdge  = error "defaultDequeuePolicy: core to edge not applicable"
+defaultDequeuePolicy NodeRelay = go
+  where
+    -- Dequeueing policy for relay nodes
+    go :: DequeuePolicy
+    go NodeCore  = Dequeue (MaxMsgPerSec 1) (MaxInFlight 1)
+    go NodeRelay = Dequeue (MaxMsgPerSec 3) (MaxInFlight 2)
+    go NodeEdge  = Dequeue (MaxMsgPerSec 1) (MaxInFlight 1)
+defaultDequeuePolicy NodeEdge = go
+  where
+    -- Dequeueing policy for edge nodes
+    go :: DequeuePolicy
+    go NodeCore  = error "defaultDequeuePolicy: edge to core not applicable"
+    go NodeRelay = Dequeue (MaxMsgPerSec 1) (MaxInFlight 1)
+    go NodeEdge  = error "defaultDequeuePolicy: edge to edge not applicable"
 
 {-------------------------------------------------------------------------------
   Thin wrapper around ConcurrentMultiQueue
@@ -443,9 +493,9 @@ checkMaxInFlight dequeuePolicy inFlight nid =
 
 delay :: ClassifyNode nid => DequeuePolicy -> nid -> IO ()
 delay dequeuePolicy nid =
-    case deqDelay (dequeuePolicy (classifyNode nid)) of
+    case deqRateLimit (dequeuePolicy (classifyNode nid)) of
       NoRateLimiting -> return ()
-      Delay n        -> threadDelay n
+      MaxMsgPerSec n -> threadDelay (1000000 `div` n)
 
 rsDequeue :: forall msg nid.
              OutboundQ msg nid -> SendMsg msg nid -> IO (Maybe CtrlMsg)

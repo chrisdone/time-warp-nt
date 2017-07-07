@@ -28,18 +28,29 @@ data MsgType =
 data NodeType =
     -- | Core node
     --
-    -- A core node is one that is able to generate blocks
+    -- Core nodes:
+    --
+    -- * can become slot leader
+    -- * never create currency transactions
     NodeCore
 
     -- | Edge node
     --
-    -- An edge node is one that generates new transactions
+    -- Edge nodes:
+    --
+    -- * cannot become slot leader
+    -- * creates currency transactions,
+    -- * cannot communicate with core nodes
+    -- * may or may not be behind NAT/firewalls
   | NodeEdge
 
     -- | Relay node
     --
-    -- A relay node neither generates blocks nor generates transactions.
-    -- They sit in between core nodes and edge nodes.
+    -- Relay nodes:
+    --
+    -- * cannot become slot leader
+    -- * never create currency transactions
+    -- * can communicate with core nodes
   | NodeRelay
   deriving (Show, Eq, Ord)
 
