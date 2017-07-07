@@ -6,11 +6,20 @@ import Control.Monad
 import Data.Function
 import Data.Set (Set)
 import System.IO.Unsafe
+import System.Wlog
 import qualified Data.Set as Set
 
 import Network.Broadcast.OutboundQueue (OutboundQ)
 import Network.Broadcast.OutboundQueue.Classification
 import qualified Network.Broadcast.OutboundQueue as OutQ
+
+{-------------------------------------------------------------------------------
+  Quick hack to make the demo compile
+-------------------------------------------------------------------------------}
+
+instance HasLoggerName IO where
+  getLoggerName = undefined
+  modifyLoggerName = undefined
 
 {-------------------------------------------------------------------------------
   Relay demo
