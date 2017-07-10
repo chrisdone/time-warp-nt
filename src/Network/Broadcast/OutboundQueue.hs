@@ -12,6 +12,7 @@
   * IERs_V2.md
 -------------------------------------------------------------------------------}
 
+{-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE GADTs               #-}
 {-# LANGUAGE NamedFieldPuns      #-}
 {-# LANGUAGE RankNTypes          #-}
@@ -57,7 +58,6 @@ module Network.Broadcast.OutboundQueue (
   ) where
 
 import Control.Concurrent
-import Control.Concurrent.Async
 import Control.Exception
 import Control.Lens
 import Control.Monad
@@ -75,6 +75,7 @@ import qualified Data.Set        as Set
 import Network.Broadcast.OutboundQueue.Classification
 import Network.Broadcast.OutboundQueue.ConcurrentMultiQueue (MultiQueue)
 import qualified Network.Broadcast.OutboundQueue.ConcurrentMultiQueue as MQ
+import qualified Mockable as M
 
 {-------------------------------------------------------------------------------
   Precedence levels
@@ -340,8 +341,9 @@ data Key nid =
 -- | MultiQueue instantiated at the types we need
 type MQ msg nid = MultiQueue (Key nid) (Packet msg nid)
 
-mqEnqueue :: Ord nid => MQ msg nid -> Packet msg nid -> Precedence -> IO ()
-mqEnqueue qs pkt@Packet{dest} prec =
+mqEnqueue :: (MonadIO m, Ord nid)
+          => MQ msg nid -> Packet msg nid -> Precedence -> m ()
+mqEnqueue qs pkt@Packet{dest} prec = liftIO $
   MQ.enqueue qs [ KeyByPrec prec
                 , KeyByDest dest
                 , KeyByDestPrec dest prec
@@ -353,47 +355,28 @@ mqEnqueue qs pkt@Packet{dest} prec =
 -- (i.e., number of in-flight messages is less than the max)
 type NotBusy nid = nid -> Bool
 
-mqDequeue :: Ord nid => MQ msg nid -> NotBusy nid -> IO (Maybe (Packet msg nid))
+mqDequeue :: (MonadIO m, Ord nid)
+          => MQ msg nid -> NotBusy nid -> m (Maybe (Packet msg nid))
 mqDequeue qs notBusy =
     foldr1 orElseM [
-        MQ.dequeue (KeyByPrec prec) (notBusy . dest) qs
+        liftIO $ MQ.dequeue (KeyByPrec prec) (notBusy . dest) qs
       | prec <- enumPrecHighestFirst
       ]
 
 {-------------------------------------------------------------------------------
-  In-flight messages (i.e., messages already sent but not yet acknowledged)
+  State Initialization
 -------------------------------------------------------------------------------}
 
--- | Handler for a single message
-type MsgHandler = Async ()
+-- | How many messages are in-flight to each destination?
+type InFlight nid = Map nid Int
 
--- | How many messages are currently in-flight to a given destination?
---
--- For each destination we record the set of thread IDs of the threads
--- responsible for the in-flight messages (we spawn a new thread per message).
-type InFlight nid = Map nid (Map ThreadId MsgHandler)
+-- | Which nodes suffered from a recent communication failure?
+type Failures nid = Set nid
 
-addInFlight :: Ord nid => MVar (InFlight nid) -> nid -> MsgHandler -> IO ()
-addInFlight inFlight nid handler = applyMVar_ inFlight $ Map.alter aux nid
-  where
-    aux :: Maybe (Map ThreadId MsgHandler) -> Maybe (Map ThreadId MsgHandler)
-    aux Nothing   = Just $ Map.singleton (asyncThreadId handler) handler
-    aux (Just ts) = Just $ Map.insert (asyncThreadId handler) handler ts
+inFlightTo :: Ord nid => nid -> Lens' (InFlight nid) Int
+inFlightTo nid = at nid . anon 0 (== 0)
 
-delInFlight :: Ord nid => MVar (InFlight nid) -> nid -> ThreadId -> IO ()
-delInFlight inFlight nid tid = applyMVar_ inFlight $ Map.alter aux nid
-  where
-    aux :: Maybe (Map ThreadId MsgHandler) -> Maybe (Map ThreadId MsgHandler)
-    aux Nothing   = error "delInFlight: already deleted"
-    aux (Just ts) = let ts' = Map.delete tid ts
-                    in if Map.null ts'
-                      then Nothing
-                      else Just ts'
-
-{-------------------------------------------------------------------------------
-  Initialization
--------------------------------------------------------------------------------}
-
+-- | The outbound queue (opaque data structure)
 data OutboundQ msg nid = ( ClassifyMsg msg
                          , ClassifyNode nid
                          , Ord nid
@@ -418,11 +401,8 @@ data OutboundQ msg nid = ( ClassifyMsg msg
       -- | Known peers
     , qPeers :: MVar (Peers nid)
 
-      -- | Track communication failures
-      --
-      -- When an error occurs we record it in this map and spawn a thread that
-      -- removes the error again after a delay specified by the failure policy.
-    , qFailures :: MVar (Map nid (Maybe (Async ())))
+      -- | Recent communication failures
+    , qFailures :: MVar (Failures nid)
 
       -- | Used to send control messages to the main thread
     , qCtrlMsg :: MVar CtrlMsg
@@ -434,14 +414,23 @@ data OutboundQ msg nid = ( ClassifyMsg msg
 -- | Initialize the outbound queue
 --
 -- NOTE: The dequeuing thread must be started separately. See 'dequeueThread'.
-new :: (ClassifyMsg msg, ClassifyNode nid, Ord nid, Show nid, Show msg)
-    => EnqueuePolicy -> DequeuePolicy -> FailurePolicy -> IO (OutboundQ msg nid)
-new qEnqueuePolicy qDequeuePolicy qFailurePolicy = do
+new :: ( MonadIO m
+       , ClassifyMsg msg
+       , ClassifyNode nid
+       , Ord nid
+       , Show nid
+       , Show msg
+       )
+    => EnqueuePolicy
+    -> DequeuePolicy
+    -> FailurePolicy
+    -> m (OutboundQ msg nid)
+new qEnqueuePolicy qDequeuePolicy qFailurePolicy = liftIO $ do
     qInFlight  <- newMVar Map.empty
     qScheduled <- MQ.new
     qPeers     <- newMVar mempty
     qCtrlMsg   <- newEmptyMVar
-    qFailures  <- newMVar Map.empty
+    qFailures  <- newMVar Set.empty
 
     -- Only look for control messages when the queue is empty
     let checkCtrlMsg :: IO (Maybe CtrlMsg)
@@ -463,7 +452,11 @@ intEnqueue :: forall m msg nid. (MonadIO m, WithLogger m)
            => OutboundQ msg nid -> msg -> Origin -> Peers nid -> m ()
 intEnqueue outQ@OutQ{..} msg origin peers =
     forM_ (qEnqueuePolicy (classifyMsg msg) origin) $ \enq@Enqueue{..} -> do
-      sentTo <- forM (peers ^. peersOfType enqNodeType) $ \alts -> do
+
+      let fwdSets :: AllOf (Alts nid)
+          fwdSets = peers ^. peersOfType enqNodeType
+
+      sentTo <- forM fwdSets $ \alts -> do
         mAlt <- liftIO $ pickAlt outQ enq alts
         case mAlt of
           Nothing  -> logWarning $ noAlt alts
@@ -471,7 +464,10 @@ intEnqueue outQ@OutQ{..} msg origin peers =
             mqEnqueue qScheduled (Packet msg alt) enqPrecedence
             poke qSignal
         return mAlt
-      when (null (catMaybes sentTo :: [nid])) $
+
+      -- Log an error if we didn't manage to send the message to any peer
+      -- at all (provided that we were configured to send it to some)
+      when (not (null fwdSets) && null (catMaybes sentTo :: [nid])) $
         logError msgLost
   where
     noAlt :: [nid] -> Text
@@ -489,11 +485,12 @@ intEnqueue outQ@OutQ{..} msg origin peers =
                       origin
                       peers
 
-pickAlt :: OutboundQ msg nid -> Enqueue -> Alts nid -> IO (Maybe nid)
+pickAlt :: MonadIO m
+        => OutboundQ msg nid -> Enqueue -> Alts nid -> m (Maybe nid)
 pickAlt outQ Enqueue{enqMaxAhead = MaxAhead maxAhead, ..} alts =
     foldr1 orElseM [ do
         failure <- hasRecentFailure outQ alt
-        ahead   <- currentlyAhead outQ alt enqPrecedence
+        ahead   <- countAhead outQ alt enqPrecedence
         return $ if not failure && ahead <= maxAhead
                    then Just alt
                    else Nothing
@@ -505,10 +502,12 @@ pickAlt outQ Enqueue{enqMaxAhead = MaxAhead maxAhead, ..} alts =
 -- NOTE: This is of course a highly dynamic value; by the time we get to
 -- actually enqueue the message the value might be slightly different. Bounds
 -- are thus somewhat fuzzy.
-currentlyAhead :: OutboundQ msg nid -> nid -> Precedence -> IO Int
-currentlyAhead OutQ{qScheduled} nid prec =
-    sum <$> forM [prec .. maxBound]
-                 (\prec' -> MQ.sizeBy (KeyByDestPrec nid prec') qScheduled)
+--
+-- TODO: Include in-flight.
+countAhead :: MonadIO m => OutboundQ msg nid -> nid -> Precedence -> m Int
+countAhead OutQ{qScheduled} nid prec = sum <$>
+    forM [prec .. maxBound] (\prec' -> liftIO $
+      MQ.sizeBy (KeyByDestPrec nid prec') qScheduled)
 
 {-------------------------------------------------------------------------------
   Interpreter for the dequeueing policy
@@ -517,27 +516,30 @@ currentlyAhead OutQ{qScheduled} nid prec =
 checkMaxInFlight :: (Ord nid, ClassifyNode nid)
                  => DequeuePolicy -> InFlight nid -> NotBusy nid
 checkMaxInFlight dequeuePolicy inFlight nid =
-    maybe 0 Map.size (Map.lookup nid inFlight) < n
+    Map.findWithDefault 0 nid inFlight < n
   where
     MaxInFlight n = deqMaxInFlight (dequeuePolicy (classifyNode nid))
 
-applyRateLimit :: ClassifyNode nid => DequeuePolicy -> nid -> IO ()
-applyRateLimit dequeuePolicy nid =
+applyRateLimit :: (MonadIO m, ClassifyNode nid) => DequeuePolicy -> nid -> m ()
+applyRateLimit dequeuePolicy nid = liftIO $
     case deqRateLimit (dequeuePolicy (classifyNode nid)) of
       NoRateLimiting -> return ()
       MaxMsgPerSec n -> threadDelay (1000000 `div` n)
 
-intDequeue :: forall msg nid.
-              OutboundQ msg nid -> SendMsg msg nid -> IO (Maybe CtrlMsg)
-intDequeue outQ@OutQ{..} sendMsg = do
+intDequeue :: forall m msg nid.
+              OutboundQ msg nid
+           -> ThreadRegistry m
+           -> SendMsg m msg nid
+           -> m (Maybe CtrlMsg)
+intDequeue outQ@OutQ{..} threadRegistry@TR{} sendMsg = do
     mPacket <- getPacket
     case mPacket of
       Left ctrlMsg -> return $ Just ctrlMsg
       Right packet -> sendPacket packet >> return Nothing
   where
-    getPacket :: IO (Either CtrlMsg (Packet msg nid))
+    getPacket :: m (Either CtrlMsg (Packet msg nid))
     getPacket = retryIfNothing qSignal $ do
-      inFlight <- readMVar qInFlight
+      inFlight <- liftIO $ readMVar qInFlight
       mqDequeue qScheduled (checkMaxInFlight qDequeuePolicy inFlight)
 
     -- Send the packet we just dequeued
@@ -560,23 +562,18 @@ intDequeue outQ@OutQ{..} sendMsg = do
     -- device), with no real way to prioritize any one thread over the other. We
     -- will be able to solve this conumdrum properly once we move away from TCP
     -- and use the RINA network architecture instead.
-    sendPacket :: Packet msg nid -> IO ()
-    sendPacket packet@Packet{dest} =
-      forkThread Thread {
-          threadRegister   = addInFlight qInFlight dest
-        , threadUnregister = delInFlight qInFlight dest
-        , threadBody       = sendThread packet
-        }
-
-    sendThread :: Packet msg nid -> Unmask -> IO ()
-    sendThread packet@Packet{..} unmask = do
-      mErr <- try $ unmask $ do
-        sendMsg payload dest
-        applyRateLimit qDequeuePolicy dest
-      case mErr of
-        Left err -> intFailure outQ packet err
-        Right () -> return ()
-      poke qSignal
+    sendPacket :: Packet msg nid -> m ()
+    sendPacket packet@Packet{..} = do
+      applyMVar_ qInFlight $ inFlightTo dest %~ (\n -> n + 1)
+      forkThread threadRegistry $ \unmask -> do
+        mErr <- M.try $ unmask $ do
+          sendMsg payload dest
+          applyRateLimit qDequeuePolicy dest
+        case mErr of
+          Left err -> intFailure outQ threadRegistry packet err
+          Right () -> return ()
+        applyMVar_ qInFlight $ inFlightTo dest %~ (\n -> n - 1)
+        liftIO $ poke qSignal
 
 {-------------------------------------------------------------------------------
   Interpreter for failure policy
@@ -588,27 +585,25 @@ intDequeue outQ@OutQ{..} sendMsg = do
 -- assume that there isn't an existing failure here.
 --
 -- TODO: Reduce the time of the actual send from
-intFailure :: OutboundQ msg nid -> Packet msg nid -> SomeException -> IO ()
-intFailure OutQ{..} Packet{..} err =
-    forkThread Thread {
-        threadRegister   = recordErr
-      , threadUnregister = unrecordErr
-      , threadBody       = \unmask -> unmask $ threadDelay (delay * 1000000)
-      }
+intFailure :: forall m msg nid.
+              OutboundQ msg nid
+           -> ThreadRegistry m
+           -> Packet msg nid
+           -> SomeException
+           -> m ()
+intFailure OutQ{..} threadRegistry@TR{} Packet{..} err = do
+    applyMVar_ qFailures $ Set.insert dest
+    forkThread threadRegistry $ \unmask -> do
+      unmask $ liftIO $ threadDelay (delay * 1000000)
+      applyMVar_ qFailures $ Set.delete dest
   where
     delay :: Int
     ReconsiderAfter delay = qFailurePolicy (classifyNode dest)
                                            (classifyMsg payload)
                                            err
 
-    recordErr :: Async () -> IO ()
-    recordErr thread = applyMVar_ qFailures $ Map.insert dest (Just thread)
-
-    unrecordErr :: ThreadId -> IO ()
-    unrecordErr _tid = applyMVar_ qFailures $ Map.delete dest
-
-hasRecentFailure :: OutboundQ msg nid -> nid -> IO Bool
-hasRecentFailure OutQ{..} nid = Map.member nid <$> readMVar qFailures
+hasRecentFailure :: MonadIO m => OutboundQ msg nid -> nid -> m Bool
+hasRecentFailure OutQ{..} nid = liftIO $ Set.member nid <$> readMVar qFailures
 
 {-------------------------------------------------------------------------------
   Public interface to enqueing
@@ -663,38 +658,35 @@ enqueue outQ@OutQ{..} msg origin peers' = do
 -- * The IO action will be run in a separate thread.
 -- * No additional timeout is applied to the 'SendMsg', so if one is
 --   needed it must be provided externally.
-type SendMsg msg nid = msg -> nid -> IO ()
+type SendMsg m msg nid = msg -> nid -> m ()
 
 -- | The dequeue thread
 --
 -- It is the responsibility of the next layer up to fork this thread; this
 -- function does not return unless told to terminate using 'waitShutdown'.
-dequeueThread :: OutboundQ msg nid -> SendMsg msg nid -> IO ()
-dequeueThread outQ@OutQ{..} sendMsg =
-    loop `finally` killAuxThreads
-  where
-    loop :: IO ()
-    loop = do
-      mCtrlMsg <- intDequeue outQ sendMsg
-      case mCtrlMsg of
-        Nothing      -> loop
-        Just ctrlMsg -> do
-          waitAuxThreads
-          case ctrlMsg of
-            Shutdown ack -> putMVar ack ()
-            Flush    ack -> putMVar ack () >> loop
+dequeueThread :: forall m msg nid. (
+                   MonadIO              m
+                 , M.Mockable M.Bracket m
+                 , M.Mockable M.Catch   m
+                 , M.Mockable M.Async   m
+                 , M.Mockable M.Fork    m
+                 , Ord (M.ThreadId      m)
+                 )
+              => OutboundQ msg nid -> SendMsg m msg nid -> m ()
+dequeueThread outQ@OutQ{..} sendMsg = withThreadRegistry $ \threadRegistry ->
+    let loop :: m ()
+        loop = do
+          mCtrlMsg <- intDequeue outQ threadRegistry sendMsg
+          case mCtrlMsg of
+            Nothing      -> loop
+            Just ctrlMsg -> do
+              waitAllThreads threadRegistry
+              case ctrlMsg of
+                Shutdown ack -> do liftIO $ putMVar ack ()
+                Flush    ack -> do liftIO $ putMVar ack ()
+                                   loop
 
-    getAuxThreads :: IO [MsgHandler]
-    getAuxThreads = flatten <$> readMVar qInFlight
-      where
-        flatten :: InFlight nid -> [MsgHandler]
-        flatten = concatMap Map.elems . Map.elems
-
-    waitAuxThreads :: IO ()
-    waitAuxThreads = mapM_ wait =<< getAuxThreads
-
-    killAuxThreads :: IO ()
-    killAuxThreads = mapM_ cancel =<< getAuxThreads
+    in loop
 
 {-------------------------------------------------------------------------------
   Controlling the dequeue thread
@@ -708,16 +700,16 @@ data CtrlMsg =
   | Flush    (MVar ())
 
 -- | Gracefully shutdown the relayer
-waitShutdown :: OutboundQ msg nid -> IO ()
-waitShutdown OutQ{..} = do
+waitShutdown :: MonadIO m => OutboundQ msg nid -> m ()
+waitShutdown OutQ{..} = liftIO $ do
     ack <- newEmptyMVar
     putMVar qCtrlMsg $ Shutdown ack
     poke qSignal
     takeMVar ack
 
 -- | Wait for all messages currently enqueued to have been sent
-flush :: OutboundQ msg nid -> IO ()
-flush OutQ{..} = do
+flush :: MonadIO m => OutboundQ msg nid -> m ()
+flush OutQ{..} = liftIO $ do
     ack <- newEmptyMVar
     putMVar qCtrlMsg $ Flush ack
     poke qSignal
@@ -736,7 +728,7 @@ flush OutQ{..} = do
 -- connection between the edge node and the relay node is kept open. When the
 -- edge node disappears the listener thread on the relay node should call
 -- 'unsubscribe' to remove the edge node from its outbound queue again.
-subscribe :: OutboundQ msg nid -> Peers nid -> IO ()
+subscribe :: MonadIO m => OutboundQ msg nid -> Peers nid -> m ()
 subscribe OutQ{..} peers' = applyMVar_ qPeers (<> peers')
 
 -- | Unsubscribe some nodes
@@ -744,31 +736,61 @@ subscribe OutQ{..} peers' = applyMVar_ qPeers (<> peers')
 -- See 'subscribe'.
 --
 -- TODO: Delete now-useless outbound messages from the queues.
-unsubscribe :: Ord nid => OutboundQ msg nid -> [nid] -> IO ()
+unsubscribe :: MonadIO m => Ord nid => OutboundQ msg nid -> [nid] -> m ()
 unsubscribe OutQ{..} = applyMVar_ qPeers . removePeers . Set.fromList
 
 {-------------------------------------------------------------------------------
   Auxiliary: starting and registering threads
 -------------------------------------------------------------------------------}
 
-type Unmask = forall a. IO a -> IO a
+data ThreadRegistry m =
+       ( MonadIO              m
+       , M.Mockable M.Async   m
+       , M.Mockable M.Bracket m
+       , M.Mockable M.Fork    m
+       , M.Mockable M.Catch   m
+       , Ord (M.ThreadId      m)
+       )
+    => TR (MVar (Map (M.ThreadId m) (M.Promise m ())))
 
-data Thread = Thread {
-      threadRegister   :: Async () -> IO ()
-    , threadUnregister :: ThreadId -> IO ()
-    , threadBody       :: Unmask   -> IO ()
-    }
+-- | Create a new thread registry, killing all threads when the action
+-- terminates.
+withThreadRegistry :: ( MonadIO              m
+                      , M.Mockable M.Bracket m
+                      , M.Mockable M.Async   m
+                      , M.Mockable M.Fork    m
+                      , M.Mockable M.Catch   m
+                      , Ord (M.ThreadId      m)
+                      )
+                   => (ThreadRegistry m -> m ()) -> m ()
+withThreadRegistry k = do
+    threadRegistry <- liftIO $ TR <$> newMVar Map.empty
+    k threadRegistry `M.finally` killAllThreads threadRegistry
+
+killAllThreads :: ThreadRegistry m -> m ()
+killAllThreads (TR reg) = do
+    threads <- applyMVar reg $ \threads -> (Map.empty, Map.elems threads)
+    mapM_ M.cancel threads
+
+waitAllThreads :: ThreadRegistry m -> m ()
+waitAllThreads (TR reg) = do
+    threads <- applyMVar reg $ \threads -> (Map.empty, Map.elems threads)
+    mapM_ M.wait threads
+
+type Unmask m = forall a. m a -> m a
 
 -- | Fork a new thread, taking care of registration and unregistration
-forkThread :: Thread -> IO ()
-forkThread Thread{..} = mask_ $ do
-    barrier <- newEmptyMVar
-    thread  <- asyncWithUnmask $ \unmask -> do
-                 tid <- myThreadId
-                 takeMVar barrier
-                 threadBody unmask `finally` threadUnregister tid
-    threadRegister thread
-    putMVar barrier ()
+forkThread :: ThreadRegistry m -> (Unmask m -> m ()) -> m ()
+forkThread (TR reg) threadBody = M.mask_ $ do
+    barrier <- liftIO $ newEmptyMVar
+    thread  <- M.asyncWithUnmask $ \unmask -> do
+                 tid <- M.myThreadId
+                 liftIO $ takeMVar barrier
+                 threadBody unmask `M.finally`
+                   applyMVar_ reg (at tid .~ Nothing)
+    tid     <- M.asyncThreadId thread
+    applyMVar_ reg (at tid .~ Just thread)
+    liftIO $ putMVar barrier ()
 
 {-------------------------------------------------------------------------------
   Auxiliary: Signalling
@@ -784,7 +806,7 @@ data Signal b = Signal {
     -- | Used to wake up the blocked thread
     signalPokeVar :: MVar ()
 
-    -- | Used to send out-of-band control messages to the suspended thread
+    -- | Check to see if there is an out-of-bound control message available
   , signalCtrlMsg :: IO (Maybe b)
   }
 
@@ -797,10 +819,11 @@ poke :: Signal b -> IO ()
 poke Signal{..} = void $ tryPutMVar signalPokeVar ()
 
 -- | Keep retrying an action until it succeeds, blocking between attempts.
-retryIfNothing :: forall a b. Signal b -> IO (Maybe a) -> IO (Either b a)
+retryIfNothing :: forall m a b. MonadIO m
+               => Signal b -> m (Maybe a) -> m (Either b a)
 retryIfNothing Signal{..} act = go
   where
-    go :: IO (Either b a)
+    go :: m (Either b a)
     go = do
       ma <- act
       case ma of
@@ -816,17 +839,23 @@ retryIfNothing Signal{..} act = go
           -- however: we run the action again in this new state, no matter how
           -- many changes took place. If in that new state the action still
           -- fails, then we will wait for further changes on the next iteration.
-          mCtrlMsg <- signalCtrlMsg
+          mCtrlMsg <- liftIO $ signalCtrlMsg
           case mCtrlMsg of
-            Nothing      -> takeMVar signalPokeVar >>= \() -> go
-            Just ctrlMsg -> return (Left ctrlMsg)
+            Just ctrlMsg ->
+              return (Left ctrlMsg)
+            Nothing -> do
+              liftIO $ takeMVar signalPokeVar
+              go
 
 {-------------------------------------------------------------------------------
   Auxiliary
 -------------------------------------------------------------------------------}
 
-orElseM :: IO (Maybe a) -> IO (Maybe a) -> IO (Maybe a)
+orElseM :: Monad m => m (Maybe a) -> m (Maybe a) -> m (Maybe a)
 orElseM f g = f >>= maybe g (return . Just)
 
-applyMVar_ :: MVar a -> (a -> a) -> IO ()
-applyMVar_ mv f = modifyMVar_ mv $ \a -> return $! f a
+applyMVar :: MonadIO m => MVar a -> (a -> (a, b)) -> m b
+applyMVar mv f = liftIO $ modifyMVar mv $ \a -> return $! f a
+
+applyMVar_ :: MonadIO m => MVar a -> (a -> a) -> m ()
+applyMVar_ mv f = liftIO $ modifyMVar_ mv $ \a -> return $! f a
