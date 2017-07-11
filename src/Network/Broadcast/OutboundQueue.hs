@@ -14,6 +14,7 @@
 
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE GADTs               #-}
+{-# LANGUAGE MultiWayIf          #-}
 {-# LANGUAGE NamedFieldPuns      #-}
 {-# LANGUAGE RankNTypes          #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -86,7 +87,7 @@ import qualified Mockable as M
 -- These precedence levels are not given meaningful names because the same kind
 -- of message might be given different precedence levels on different kinds of
 -- nodes. Meaning is given to these levels in the enqueueing policy.
-data Precedence = P1 | P2 | P3 | P4 | P5
+data Precedence = PLowest | PLow | PMedium | PHigh | PHighest
   deriving (Show, Eq, Ord, Enum, Bounded)
 
 enumPrecLowestFirst :: [Precedence]
@@ -107,10 +108,14 @@ data Peers nid = Peers {
     }
   deriving (Show)
 
--- | Each of these need to be contacted (in arbitrary order)
+-- | List of forwarding sets
+--
+-- Each of these need to be contacted (in arbitrary order)
 type AllOf a = [a]
 
--- | Non-empty list of alternatives (in order of preference)
+-- | Single forwarding set
+--
+-- Non-empty list of alternatives (in order of preference)
 type Alts a = [a]
 
 makeLenses ''Peers
@@ -161,12 +166,18 @@ removePeers nids peers =
 
 -- | Maximum number of messages allowed "ahead" of the message to be enqueued
 --
--- This is the total number of messages currently in-flight or in-queue with a
--- precedence at or above the message to be enqueued (i.e., all messages that
--- will be handled before the new message).
+-- This is the total number of messages currently in-flight or in-queue, with a
+-- precedence at or above the message to be enqueued.
+--
+-- We can think of this as "all messages that will be handled before the new
+-- message", although that is not /quite/ right: messages currently already
+-- in-flight with a precedence lower than the new message are not included even
+-- though they are also handled before the new message. We make this exception
+-- because the presence of low precedence in-flight messages should not affect
+-- the enqueueing policy for higher precedence messages.
 --
 -- If we cannot find any alternative that doesn't match requirements we simply
--- give up on (this list of) alternatives.
+-- give up on forwarding set.
 newtype MaxAhead = MaxAhead Int
 
 data Enqueue = Enqueue {
@@ -183,6 +194,7 @@ data Enqueue = Enqueue {
 -- pick one from _each_ of the lists that we are given. It is the responsiblity
 -- of the next layer up to configure these peers as desired.
 --
+-- TODO: Sanity check the number of forwarding sets and number of alternatives.
 -- TODO: Verify the max queue sizes against the updated policy.
 type EnqueuePolicy =
            MsgType  -- ^ Type of the message we want to send
@@ -196,15 +208,15 @@ defaultEnqueuePolicy NodeCore = go
     -- Enqueue policy for core nodes
     go :: EnqueuePolicy
     go MsgBlockHeader _ = [
-        Enqueue NodeCore  (MaxAhead 0) P1
-      , Enqueue NodeRelay (MaxAhead 0) P3
+        Enqueue NodeCore  (MaxAhead 0) PHighest
+      , Enqueue NodeRelay (MaxAhead 0) PMedium
       ]
     go MsgMPC _ = [
-        Enqueue NodeCore (MaxAhead 1) P2
+        Enqueue NodeCore (MaxAhead 1) PHigh
         -- not sent to relay nodes
       ]
     go MsgTransaction _ = [
-        Enqueue NodeCore (MaxAhead 20) P4
+        Enqueue NodeCore (MaxAhead 20) PLow
         -- not sent to relay nodes
       ]
 defaultEnqueuePolicy NodeRelay = go
@@ -212,13 +224,13 @@ defaultEnqueuePolicy NodeRelay = go
     -- Enqueue policy for relay nodes
     go :: EnqueuePolicy
     go MsgBlockHeader _ = [
-        Enqueue NodeRelay (MaxAhead 0) P1
-      , Enqueue NodeCore  (MaxAhead 0) P2
-      , Enqueue NodeEdge  (MaxAhead 0) P3
+        Enqueue NodeRelay (MaxAhead 0) PHighest
+      , Enqueue NodeCore  (MaxAhead 0) PHigh
+      , Enqueue NodeEdge  (MaxAhead 0) PMedium
       ]
     go MsgTransaction _ = [
-        Enqueue NodeCore  (MaxAhead 20) P4
-      , Enqueue NodeRelay (MaxAhead 20) P5
+        Enqueue NodeCore  (MaxAhead 20) PLow
+      , Enqueue NodeRelay (MaxAhead 20) PLowest
         -- transactions not forwarded to edge nodes
       ]
     go MsgMPC _ = [
@@ -229,7 +241,7 @@ defaultEnqueuePolicy NodeEdge = go
     -- Enqueue policy for edge nodes
     go :: EnqueuePolicy
     go MsgTransaction OriginSender = [
-        Enqueue NodeRelay (MaxAhead 0) P1
+        Enqueue NodeRelay (MaxAhead 0) PHighest
       ]
     go MsgTransaction OriginForward = [
         -- don't forward transactions that weren't created at this node
@@ -314,9 +326,16 @@ defaultFailurePolicy _ourType _theirType _msgType _err = ReconsiderAfter 200
 -------------------------------------------------------------------------------}
 
 -- | The values we store in the multiqueue
---
--- Pair a destination with the message (payload)
-data Packet msg nid = Packet {payload :: msg, dest :: nid}
+data Packet msg nid = Packet {
+    -- | The actual payload of the message
+    packetPayload :: msg
+
+    -- | Node to send it to
+  , packetDest :: nid
+
+    -- | For convenience, the precedence of the message
+  , packetPrec :: Precedence
+  }
   deriving (Show)
 
 -- | The keys we use to index the multiqueue
@@ -342,11 +361,11 @@ data Key nid =
 type MQ msg nid = MultiQueue (Key nid) (Packet msg nid)
 
 mqEnqueue :: (MonadIO m, Ord nid)
-          => MQ msg nid -> Packet msg nid -> Precedence -> m ()
-mqEnqueue qs pkt@Packet{dest} prec = liftIO $
-  MQ.enqueue qs [ KeyByPrec prec
-                , KeyByDest dest
-                , KeyByDestPrec dest prec
+          => MQ msg nid -> Packet msg nid -> m ()
+mqEnqueue qs pkt@Packet{packetDest, packetPrec} = liftIO $
+  MQ.enqueue qs [ KeyByPrec packetPrec
+                , KeyByDest packetDest
+                , KeyByDestPrec packetDest packetPrec
                 ]
                 pkt
 
@@ -359,7 +378,7 @@ mqDequeue :: (MonadIO m, Ord nid)
           => MQ msg nid -> NotBusy nid -> m (Maybe (Packet msg nid))
 mqDequeue qs notBusy =
     foldr1 orElseM [
-        liftIO $ MQ.dequeue (KeyByPrec prec) (notBusy . dest) qs
+        liftIO $ MQ.dequeue (KeyByPrec prec) (notBusy . packetDest) qs
       | prec <- enumPrecHighestFirst
       ]
 
@@ -368,13 +387,16 @@ mqDequeue qs notBusy =
 -------------------------------------------------------------------------------}
 
 -- | How many messages are in-flight to each destination?
-type InFlight nid = Map nid Int
+type InFlight nid = Map nid (Map Precedence Int)
 
 -- | Which nodes suffered from a recent communication failure?
 type Failures nid = Set nid
 
-inFlightTo :: Ord nid => nid -> Lens' (InFlight nid) Int
-inFlightTo nid = at nid . anon 0 (== 0)
+inFlightTo :: Ord nid => nid -> Lens' (InFlight nid) (Map Precedence Int)
+inFlightTo nid = at nid . anon Map.empty Map.null
+
+inFlightWithPrec :: Ord nid => nid -> Precedence -> Lens' (InFlight nid) Int
+inFlightWithPrec nid prec = inFlightTo nid . at prec . anon 0 (== 0)
 
 -- | The outbound queue (opaque data structure)
 data OutboundQ msg nid = ( ClassifyMsg msg
@@ -383,8 +405,11 @@ data OutboundQ msg nid = ( ClassifyMsg msg
                          , Show nid
                          , Show msg
                          ) => OutQ {
+      -- | Node ID of the current node (primarily for debugging purposes)
+      qSelf :: nid
+
       -- | Enqueuing policy
-      qEnqueuePolicy :: EnqueuePolicy
+    , qEnqueuePolicy :: EnqueuePolicy
 
       -- | Dequeueing policy
     , qDequeuePolicy :: DequeuePolicy
@@ -421,11 +446,12 @@ new :: ( MonadIO m
        , Show nid
        , Show msg
        )
-    => EnqueuePolicy
+    => nid            -- ^ Node ID of the current node
+    -> EnqueuePolicy
     -> DequeuePolicy
     -> FailurePolicy
     -> m (OutboundQ msg nid)
-new qEnqueuePolicy qDequeuePolicy qFailurePolicy = liftIO $ do
+new qSelf qEnqueuePolicy qDequeuePolicy qFailurePolicy = liftIO $ do
     qInFlight  <- newMVar Map.empty
     qScheduled <- MQ.new
     qPeers     <- newMVar mempty
@@ -456,36 +482,63 @@ intEnqueue outQ@OutQ{..} msg origin peers =
       let fwdSets :: AllOf (Alts nid)
           fwdSets = peers ^. peersOfType enqNodeType
 
-      sentTo <- forM fwdSets $ \alts -> do
-        mAlt <- liftIO $ pickAlt outQ enq alts
-        case mAlt of
-          Nothing  -> logWarning $ noAlt alts
-          Just alt -> liftIO $ do
-            mqEnqueue qScheduled (Packet msg alt) enqPrecedence
-            poke qSignal
-        return mAlt
+          goFwdSet :: Alts nid -> m (Maybe nid)
+          goFwdSet alts = do
+            mAlt <- pickAlt outQ enq alts
+            case mAlt of
+              Nothing  ->
+                logWarning $ msgNoAlt alts
+              Just alt -> liftIO $ do
+                mqEnqueue qScheduled $ Packet msg alt enqPrecedence
+                poke qSignal
+            return mAlt
+
+      sentTo <- catMaybes <$> mapM goFwdSet fwdSets
 
       -- Log an error if we didn't manage to send the message to any peer
       -- at all (provided that we were configured to send it to some)
-      when (not (null fwdSets) && null (catMaybes sentTo :: [nid])) $
-        logError msgLost
+      if | null fwdSets ->
+             logDebug $ msgNotSent enq -- This isn't an error
+         | null sentTo ->
+             logError msgLost
+         | otherwise ->
+            logDebug $ msgEnqueued sentTo
   where
-    noAlt :: [nid] -> Text
-    noAlt = sformat ("Could not choose suitable alternative from " % shown)
+    msgNotSent :: Enqueue -> Text
+    msgNotSent Enqueue{..} = sformat
+      ( shown
+      % ": message "
+      % shown
+      % " not sent to any nodes of type "
+      % shown
+      % " since no such peers listed in "
+      % shown
+      )
+      qSelf
+      msg
+      enqNodeType
+      peers
+
+    msgEnqueued :: [nid] -> Text
+    msgEnqueued sentTo =
+      sformat (shown % ": message " % shown % " enqueued to " % shown)
+              qSelf msg sentTo
+
+    msgNoAlt :: [nid] -> Text
+    msgNoAlt alts =
+      sformat (shown % ": could not choose suitable alternative from " % shown)
+              qSelf alts
 
     msgLost :: Text
-    msgLost = sformat ( "Failed to send message "
-                      % shown
-                      % " with origin "
-                      % shown
-                      % " to peers "
-                      % shown
-                      )
-                      msg
-                      origin
-                      peers
+    msgLost =
+      sformat ( shown
+              % ": failed to send message " % shown
+              % " with origin " % shown
+              % " to peers " % shown
+              )
+              qSelf msg origin peers
 
-pickAlt :: MonadIO m
+pickAlt :: (MonadIO m, WithLogger m)
         => OutboundQ msg nid -> Enqueue -> Alts nid -> m (Maybe nid)
 pickAlt outQ Enqueue{enqMaxAhead = MaxAhead maxAhead, ..} alts =
     foldr1 orElseM [ do
@@ -502,12 +555,19 @@ pickAlt outQ Enqueue{enqMaxAhead = MaxAhead maxAhead, ..} alts =
 -- NOTE: This is of course a highly dynamic value; by the time we get to
 -- actually enqueue the message the value might be slightly different. Bounds
 -- are thus somewhat fuzzy.
---
--- TODO: Include in-flight.
-countAhead :: MonadIO m => OutboundQ msg nid -> nid -> Precedence -> m Int
-countAhead OutQ{qScheduled} nid prec = sum <$>
-    forM [prec .. maxBound] (\prec' -> liftIO $
-      MQ.sizeBy (KeyByDestPrec nid prec') qScheduled)
+countAhead :: forall m msg nid. (MonadIO m, WithLogger m)
+           => OutboundQ msg nid -> nid -> Precedence -> m Int
+countAhead OutQ{..} nid prec = do
+    logDebug . msgInFlight =<< liftIO (readMVar qInFlight)
+    liftIO $ do
+      inFlight <- forM [prec .. maxBound] $ \prec' ->
+                    view (inFlightWithPrec nid prec') <$> readMVar qInFlight
+      inQueue  <- forM [prec .. maxBound] $ \prec' ->
+                    MQ.sizeBy (KeyByDestPrec nid prec') qScheduled
+      return $ sum inFlight + sum inQueue
+  where
+    msgInFlight :: InFlight nid -> Text
+    msgInFlight = sformat (shown % ": inFlight = " % shown) qSelf
 
 {-------------------------------------------------------------------------------
   Interpreter for the dequeueing policy
@@ -516,7 +576,7 @@ countAhead OutQ{qScheduled} nid prec = sum <$>
 checkMaxInFlight :: (Ord nid, ClassifyNode nid)
                  => DequeuePolicy -> InFlight nid -> NotBusy nid
 checkMaxInFlight dequeuePolicy inFlight nid =
-    Map.findWithDefault 0 nid inFlight < n
+    sum (Map.elems (inFlight ^. inFlightTo nid)) < n
   where
     MaxInFlight n = deqMaxInFlight (dequeuePolicy (classifyNode nid))
 
@@ -526,8 +586,8 @@ applyRateLimit dequeuePolicy nid = liftIO $
       NoRateLimiting -> return ()
       MaxMsgPerSec n -> threadDelay (1000000 `div` n)
 
-intDequeue :: forall m msg nid.
-              OutboundQ msg nid
+intDequeue :: forall m msg nid. WithLogger m
+           => OutboundQ msg nid
            -> ThreadRegistry m
            -> SendMsg m msg nid
            -> m (Maybe CtrlMsg)
@@ -564,15 +624,19 @@ intDequeue outQ@OutQ{..} threadRegistry@TR{} sendMsg = do
     -- and use the RINA network architecture instead.
     sendPacket :: Packet msg nid -> m ()
     sendPacket packet@Packet{..} = do
-      applyMVar_ qInFlight $ inFlightTo dest %~ (\n -> n + 1)
+      applyMVar_ qInFlight $
+        inFlightWithPrec packetDest packetPrec %~ (\n -> n + 1)
       forkThread threadRegistry $ \unmask -> do
+        logDebug $ sformat (shown % ": sending " % shown) qSelf packet
         mErr <- M.try $ unmask $ do
-          sendMsg payload dest
-          applyRateLimit qDequeuePolicy dest
+          sendMsg packetPayload packetDest
+          applyRateLimit qDequeuePolicy packetDest
         case mErr of
           Left err -> intFailure outQ threadRegistry packet err
           Right () -> return ()
-        applyMVar_ qInFlight $ inFlightTo dest %~ (\n -> n - 1)
+        applyMVar_ qInFlight $
+          inFlightWithPrec packetDest packetPrec %~ (\n -> n - 1)
+        logDebug $ sformat (shown % ": sent " % shown) qSelf packet
         liftIO $ poke qSignal
 
 {-------------------------------------------------------------------------------
@@ -592,14 +656,14 @@ intFailure :: forall m msg nid.
            -> SomeException
            -> m ()
 intFailure OutQ{..} threadRegistry@TR{} Packet{..} err = do
-    applyMVar_ qFailures $ Set.insert dest
+    applyMVar_ qFailures $ Set.insert packetDest
     forkThread threadRegistry $ \unmask -> do
       unmask $ liftIO $ threadDelay (delay * 1000000)
-      applyMVar_ qFailures $ Set.delete dest
+      applyMVar_ qFailures $ Set.delete packetDest
   where
     delay :: Int
-    ReconsiderAfter delay = qFailurePolicy (classifyNode dest)
-                                           (classifyMsg payload)
+    ReconsiderAfter delay = qFailurePolicy (classifyNode packetDest)
+                                           (classifyMsg  packetPayload)
                                            err
 
 hasRecentFailure :: MonadIO m => OutboundQ msg nid -> nid -> m Bool
@@ -622,6 +686,9 @@ data Origin =
     OriginSender
 
     -- | It originated elsewhere; we're just forwarding it
+    --
+    -- TODO: Should we who it came from, so that we can avoid sending it
+    -- straight back at them?
   | OriginForward
   deriving (Show)
 
@@ -671,6 +738,7 @@ dequeueThread :: forall m msg nid. (
                  , M.Mockable M.Async   m
                  , M.Mockable M.Fork    m
                  , Ord (M.ThreadId      m)
+                 , WithLogger           m
                  )
               => OutboundQ msg nid -> SendMsg m msg nid -> m ()
 dequeueThread outQ@OutQ{..} sendMsg = withThreadRegistry $ \threadRegistry ->

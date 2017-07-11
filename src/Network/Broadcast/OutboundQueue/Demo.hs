@@ -1,5 +1,6 @@
 {-# LANGUAGE InstanceSigs          #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE RecursiveDo           #-}
 {-# LANGUAGE ScopedTypeVariables   #-}
 {-# LANGUAGE TypeFamilies          #-}
 {-# LANGUAGE UndecidableInstances  #-}
@@ -12,7 +13,8 @@ import Control.Monad
 import Control.Monad.IO.Class
 import Data.Function
 import Data.Set (Set)
-import System.IO.Unsafe
+import Data.Text (Text)
+import Formatting (sformat, (%), shown)
 import System.Wlog
 import qualified Data.Set as Set
 
@@ -35,6 +37,8 @@ newtype Dequeue a = Dequeue { unDequeue :: M.Production a }
            , MonadIO
            , M.Mockable M.Bracket
            , M.Mockable M.Catch
+           , CanLog
+           , HasLoggerName
            )
 
 type instance M.ThreadId Dequeue = M.ThreadId M.Production
@@ -66,16 +70,18 @@ runEnqueue = M.runProduction . unEnqueue
 
 relayDemo :: IO ()
 relayDemo = do
-    let block :: String -> [Node] -> Enqueue () -> Enqueue ()
+    updateGlobalLogger "*production*" (setLevel Notice)
+
+    let block :: Text -> [Node] -> Enqueue () -> Enqueue ()
         block label nodes act = do
-          logMsg label
+          logNotice label
           act
           mapM_ (OutQ.flush . nodeOutQ) nodes
           liftIO $ threadDelay 500000
 
     -- Set up some test nodes
 
-    nodeC1 <- newNode $ NodeCfg "C"  NodeCore  (CommsDelay 0)
+    nodeC1 <- newNode $ NodeCfg "C1" NodeCore  (CommsDelay 0)
     nodeE1 <- newNode $ NodeCfg "E1" NodeEdge  (CommsDelay 0)
     nodeE2 <- newNode $ NodeCfg "E2" NodeEdge  (CommsDelay 0)
     nodeR  <- newNode $ NodeCfg "R1" NodeRelay (CommsDelay 0)
@@ -121,7 +127,7 @@ relayDemo = do
         forM_ [Msg MsgBlockHeader n | n <- [21..30]] $ \msg ->
           sendFrom nodeC2 msg
 
-      logMsg "End of demo"
+      logNotice "End of demo"
 
 {-------------------------------------------------------------------------------
   Outbound queue used for the demo
@@ -134,17 +140,6 @@ data Msg = Msg { msgType :: MsgType, _msgContents :: Int }
 
 instance ClassifyMsg  Msg  where classifyMsg  = msgType
 instance ClassifyNode Node where classifyNode = nodeType . nodeCfg
-
-newDemoQ :: NodeType -> IO DemoQ
-newDemoQ selfType = do
-    demoQ <- OutQ.new (OutQ.defaultEnqueuePolicy selfType)
-                      (OutQ.defaultDequeuePolicy selfType)
-                      (OutQ.defaultFailurePolicy selfType)
-    _tid  <- forkIO $ runDequeue $ OutQ.dequeueThread demoQ sendMsg
-    return demoQ
-  where
-    sendMsg :: OutQ.SendMsg Dequeue Msg Node
-    sendMsg = \msg Node{..} -> liftIO $ send nodeChan msg
 
 {-------------------------------------------------------------------------------
   Model of a node
@@ -178,17 +173,27 @@ instance Ord  Node where (<=) = (<=) `on` (nodeId . nodeCfg)
 instance Show Node where show = show .    (nodeId . nodeCfg)
 
 newNode :: NodeCfg -> IO Node
-newNode nodeCfg@NodeCfg{..} = do
-    nodeOutQ    <- newDemoQ nodeType
-    nodeChan    <- newSyncVar
-    nodeMsgPool <- newMsgPool
-    _tid <- forkIO $ runEnqueue $ forever $ do
+newNode nodeCfg@NodeCfg{..} = mdo
+    nodeOutQ     <- OutQ.new node
+                             (OutQ.defaultEnqueuePolicy nodeType)
+                             (OutQ.defaultDequeuePolicy nodeType)
+                             (OutQ.defaultFailurePolicy nodeType)
+    _deqWorker   <- forkIO $ runDequeue $ OutQ.dequeueThread nodeOutQ sendMsg
+    nodeChan     <- newSyncVar
+    nodeMsgPool  <- newMsgPool
+    _deqListener <- forkIO $ runEnqueue $ forever $ do
       msg   <- recv nodeChan nodeCommsDelay
       added <- addToMsgPool nodeMsgPool msg
-      when added $ do
-        logMsg $ nodeId ++ ": received " ++ show msg
+      if added then do
+        logNotice $ sformat (shown % ": received " % shown) nodeId msg
         OutQ.enqueue nodeOutQ msg OutQ.OriginForward mempty
-    return Node{..}
+      else do
+        logDebug $ sformat (shown % ": discarded " % shown) nodeId msg
+    let node = Node{..}
+    return node
+  where
+    sendMsg :: OutQ.SendMsg Dequeue Msg Node
+    sendMsg = \msg them -> liftIO $ send (nodeChan them) msg
 
 setPeers :: Node -> [Node] -> IO ()
 setPeers Node{..} = OutQ.subscribe nodeOutQ . OutQ.simplePeers
@@ -244,14 +249,3 @@ recv (SyncVar v) (CommsDelay delay) = liftIO $ do
       threadDelay delay
       putMVar ack ()
     return a
-
-{-------------------------------------------------------------------------------
-  Auxiliary: thread-safe logging
--------------------------------------------------------------------------------}
-
-logLock :: MVar ()
-{-# NOINLINE logLock #-}
-logLock = unsafePerformIO $ newMVar ()
-
-logMsg :: MonadIO m => String -> m ()
-logMsg msg = liftIO $ withMVar logLock $ \() -> putStrLn msg
